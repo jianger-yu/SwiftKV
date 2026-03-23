@@ -12,32 +12,6 @@ import (
 	"kvraft/rsm"
 )
 
-// SimplePersister 实现一个简单的内存持久化器（用于演示）
-// 在生产环境中应该使用文件系统或数据库
-type SimplePersister struct {
-	raftState []byte
-	snapshot  []byte
-}
-
-func (sp *SimplePersister) ReadRaftState() []byte {
-	return sp.raftState
-}
-
-func (sp *SimplePersister) ReadSnapshot() []byte {
-	return sp.snapshot
-}
-
-func (sp *SimplePersister) Save(raftstate []byte, snapshot []byte) {
-	sp.raftState = make([]byte, len(raftstate))
-	copy(sp.raftState, raftstate)
-	sp.snapshot = make([]byte, len(snapshot))
-	copy(sp.snapshot, snapshot)
-}
-
-func (sp *SimplePersister) RaftStateSize() int {
-	return len(sp.raftState)
-}
-
 func main() {
 	// 定义命令行参数
 	mePtr := flag.Int("me", -1, "当前服务器在集群中的索引（0, 1, 2, ...）")
@@ -86,8 +60,13 @@ func main() {
 	fmt.Printf("Raft 最大日志大小: %d\n", *maxRaftStatePtr)
 	fmt.Println()
 
-	// 创建持久化器
-	persister := &SimplePersister{}
+	// 创建持久化器（基于文件系统，支持重启后恢复）
+	raftDataDir := "badger-" + address
+	persister, err := rsm.NewFilePersister(raftDataDir)
+	if err != nil {
+		log.Fatalf("创建持久化器失败: %v", err)
+	}
+	defer persister.Close()
 
 	// 启动 KV 服务器
 	// 参数说明：

@@ -5,47 +5,16 @@ import (
 	"flag"
 	"fmt"
 	"math/rand"
+	"os"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	kvraftapi "kvraft/raftkv/rpc"
 	"kvraft/rsm"
 )
 
-// SimplePersister 实现一个简单的内存持久化器。
-type SimplePersister struct {
-	mu        sync.Mutex
-	raftState []byte
-	snapshot  []byte
-}
-
-func (sp *SimplePersister) ReadRaftState() []byte {
-	sp.mu.Lock()
-	defer sp.mu.Unlock()
-	return sp.raftState
-}
-
-func (sp *SimplePersister) ReadSnapshot() []byte {
-	sp.mu.Lock()
-	defer sp.mu.Unlock()
-	return sp.snapshot
-}
-
-func (sp *SimplePersister) Save(raftstate []byte, snapshot []byte) {
-	sp.mu.Lock()
-	defer sp.mu.Unlock()
-	sp.raftState = make([]byte, len(raftstate))
-	copy(sp.raftState, raftstate)
-	sp.snapshot = make([]byte, len(snapshot))
-	copy(sp.snapshot, snapshot)
-}
-
-func (sp *SimplePersister) RaftStateSize() int {
-	sp.mu.Lock()
-	defer sp.mu.Unlock()
-	return len(sp.raftState)
-}
+// 注意：SimplePersister 已移至 rsm/persister.go (FilePersister)
+// 使用 FilePersister 实现真正的磁盘持久化
 
 // BenchmarkConfig 描述压测配置。
 type BenchmarkConfig struct {
@@ -67,6 +36,12 @@ type BenchmarkResult struct {
 	MinLatency      time.Duration
 	MaxLatency      time.Duration
 	AvgLatency      time.Duration
+}
+
+func cleanBenchmarkDataDirs(servers []string) {
+	for _, addr := range servers {
+		_ = os.RemoveAll("badger-" + addr)
+	}
 }
 
 // RunRealBenchmark 启动一个实际的 KVraft 集群进行压测
@@ -95,11 +70,17 @@ func RunRealBenchmark(ctx context.Context, cfg BenchmarkConfig) (BenchmarkResult
 
 	// 2. 启动集群
 	fmt.Print("启动 KVraft 集群...")
+	// 每次压测前清理旧数据，避免历史版本导致初始化阶段大量 ErrVersion。
+	cleanBenchmarkDataDirs(servers)
 	kvServers := make([]*rsm.KVServer, cfg.Servers)
-	persisters := make([]*SimplePersister, cfg.Servers)
+	persisters := make([]rsm.Persister, cfg.Servers)
 
 	for i := 0; i < cfg.Servers; i++ {
-		persisters[i] = &SimplePersister{}
+		p, err := rsm.NewFilePersister("badger-" + servers[i])
+		if err != nil {
+			return BenchmarkResult{}, fmt.Errorf("create persister for server %d: %w", i, err)
+		}
+		persisters[i] = p
 		kvServers[i] = rsm.StartKVServer(servers, 1, i, persisters[i], -1, servers[i])
 	}
 	fmt.Printf(" OK (%d 个节点)\n", cfg.Servers)
@@ -109,16 +90,72 @@ func RunRealBenchmark(ctx context.Context, cfg BenchmarkConfig) (BenchmarkResult
 	time.Sleep(1000 * time.Millisecond) // 给 raft 时间选举 leader
 	fmt.Println(" OK")
 
-	// 4. 初始化 key 空间
+	// 4. 初始化 key 空间（并发预热）
 	fmt.Print("初始化 key 空间...")
-	clerk := rsm.MakeClerk(servers)
-	for i := 0; i < cfg.Keys; i++ {
-		key := fmt.Sprintf("key-%d", i)
-		value := fmt.Sprintf("value-%d", i)
-		_ = clerk.Put(key, value, 0)
+	initStart := time.Now()
+	initWorkers := cfg.Clients
+	if initWorkers < 1 {
+		initWorkers = 1
 	}
-	clerk.Close()
-	fmt.Printf(" OK (%d 个 key)\n", cfg.Keys)
+	if initWorkers > 32 {
+		initWorkers = 32
+	}
+	if cfg.Keys > 0 && initWorkers > cfg.Keys {
+		initWorkers = cfg.Keys
+	}
+
+	initKeyCh := make(chan int, initWorkers*2)
+	var initWg sync.WaitGroup
+	var initMu sync.Mutex
+	var initOK int64
+	var initFail int64
+	var initVersionConflict int64
+
+	for w := 0; w < initWorkers; w++ {
+		initWg.Add(1)
+		go func() {
+			defer initWg.Done()
+			c := rsm.MakeClerk(servers)
+			defer c.Close()
+
+			var localOK int64
+			var localFail int64
+			var localVersionConflict int64
+			for i := range initKeyCh {
+				key := fmt.Sprintf("key-%d", i)
+				value := fmt.Sprintf("value-%d", i)
+				errCode := c.Put(key, value, 0)
+				if errCode == kvraftapi.OK {
+					localOK++
+				} else if errCode == kvraftapi.ErrVersion {
+					// 历史数据已存在时视作预热成功。
+					localOK++
+					localVersionConflict++
+				} else {
+					localFail++
+				}
+			}
+
+			initMu.Lock()
+			initOK += localOK
+			initFail += localFail
+			initVersionConflict += localVersionConflict
+			initMu.Unlock()
+		}()
+	}
+
+	for i := 0; i < cfg.Keys; i++ {
+		initKeyCh <- i
+	}
+	close(initKeyCh)
+	initWg.Wait()
+	initDuration := time.Since(initStart)
+
+	initOpsPerSec := 0.0
+	if initDuration.Seconds() > 0 {
+		initOpsPerSec = float64(initOK) / initDuration.Seconds()
+	}
+	fmt.Printf(" OK (%d 个 key, workers=%d, init fail=%d, version-conflict=%d, init throughput=%.2f ops/s)\n", cfg.Keys, initWorkers, initFail, initVersionConflict, initOpsPerSec)
 
 	// 5. 运行压测
 	fmt.Printf("运行压测 (%d 个客户端, 每个 %d 个请求)...\n", cfg.Clients, cfg.Requests)
@@ -128,12 +165,16 @@ func RunRealBenchmark(ctx context.Context, cfg BenchmarkConfig) (BenchmarkResult
 	}
 	var mu sync.Mutex
 	var wg sync.WaitGroup
-	var latencies []time.Duration
-	var latenciesMu sync.Mutex
+	var totalLatency time.Duration
+	var latencySamples int64
 	workerClerks := make([]*rsm.Clerk, cfg.Clients)
 	for i := 0; i < cfg.Clients; i++ {
 		workerClerks[i] = rsm.MakeClerk(servers)
 	}
+
+	// 创建新的context用于压测，不受初始化时间影响
+	benchCtx, benchCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer benchCancel()
 
 	start := time.Now()
 
@@ -143,12 +184,21 @@ func RunRealBenchmark(ctx context.Context, cfg BenchmarkConfig) (BenchmarkResult
 			defer wg.Done()
 			workerClerk := workerClerks[id]
 			r := rand.New(rand.NewSource(int64(id)*1000 + time.Now().UnixNano()))
-			localLatencies := make([]time.Duration, 0, cfg.Requests)
 
+			var localRead int64
+			var localWrite int64
+			var localSuccess int64
+			var localFailed int64
+			var localLatencySum time.Duration
+			var localSamples int64
+			localMinLatency := time.Duration(1<<63 - 1)
+			localMaxLatency := time.Duration(0)
+
+		loop:
 			for i := 0; i < cfg.Requests; i++ {
 				select {
-				case <-ctx.Done():
-					return
+				case <-benchCtx.Done():
+					break loop
 				default:
 				}
 
@@ -158,39 +208,48 @@ func RunRealBenchmark(ctx context.Context, cfg BenchmarkConfig) (BenchmarkResult
 
 				if r.Float64() < cfg.ReadRatio {
 					_, _, errCode = workerClerk.Get(key)
-					atomic.AddInt64(&res.ReadRequests, 1)
+					localRead++
 				} else {
 					value := fmt.Sprintf("value-%d-%d", id, i)
 					errCode = workerClerk.Put(key, value, 0)
-					atomic.AddInt64(&res.WriteRequests, 1)
+					localWrite++
 				}
 
 				latency := time.Since(opStart)
-				localLatencies = append(localLatencies, latency)
+				localLatencySum += latency
+				localSamples++
+				if latency < localMinLatency {
+					localMinLatency = latency
+				}
+				if latency > localMaxLatency {
+					localMaxLatency = latency
+				}
 
 				// 成功条件：返回OK、ErrNoKey或ErrVersion都算成功
 				// OK: 正常成功
 				// ErrNoKey: 读取的key不存在（支持的）
 				// ErrVersion: 写入的版本不匹配（并发冲突被正确处理，算成功）
 				if errCode == kvraftapi.OK || errCode == kvraftapi.ErrNoKey || errCode == kvraftapi.ErrVersion {
-					atomic.AddInt64(&res.SuccessRequests, 1)
+					localSuccess++
 				} else {
-					atomic.AddInt64(&res.FailedRequests, 1)
+					localFailed++
 				}
-
-				mu.Lock()
-				if latency < res.MinLatency {
-					res.MinLatency = latency
-				}
-				if latency > res.MaxLatency {
-					res.MaxLatency = latency
-				}
-				mu.Unlock()
 			}
 
-			latenciesMu.Lock()
-			latencies = append(latencies, localLatencies...)
-			latenciesMu.Unlock()
+			mu.Lock()
+			res.ReadRequests += localRead
+			res.WriteRequests += localWrite
+			res.SuccessRequests += localSuccess
+			res.FailedRequests += localFailed
+			totalLatency += localLatencySum
+			latencySamples += localSamples
+			if localMinLatency < res.MinLatency {
+				res.MinLatency = localMinLatency
+			}
+			if localMaxLatency > res.MaxLatency {
+				res.MaxLatency = localMaxLatency
+			}
+			mu.Unlock()
 		}(clientIdx)
 	}
 
@@ -200,12 +259,11 @@ func RunRealBenchmark(ctx context.Context, cfg BenchmarkConfig) (BenchmarkResult
 	res.TotalRequests = res.ReadRequests + res.WriteRequests
 
 	// 6. 计算平均延迟
-	if len(latencies) > 0 {
-		var totalLatency time.Duration
-		for _, lat := range latencies {
-			totalLatency += lat
-		}
-		res.AvgLatency = totalLatency / time.Duration(len(latencies))
+	if latencySamples > 0 {
+		res.AvgLatency = totalLatency / time.Duration(latencySamples)
+	} else {
+		res.MinLatency = 0
+		res.MaxLatency = 0
 	}
 
 	// 7. 清理资源
@@ -224,66 +282,6 @@ func RunRealBenchmark(ctx context.Context, cfg BenchmarkConfig) (BenchmarkResult
 }
 
 func main() {
-	servers := flag.Int("servers", 3, "KVraft 集群节点数")
-	clients := flag.Int("clients", 10, "并发客户端数")
-	requests := flag.Int("requests", 1000, "每个客户端的请求数")
-	readRatio := flag.Float64("read-ratio", 0.7, "读请求比例 (0.0-1.0)")
-	keys := flag.Int("keys", 10000, "key 空间大小")
-	duration := flag.Duration("duration", 30*time.Second, "压测最长时长")
-	flag.Parse()
-
-	cfg := BenchmarkConfig{
-		Servers:   *servers,
-		Clients:   *clients,
-		Requests:  *requests,
-		ReadRatio: *readRatio,
-		Keys:      *keys,
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), *duration)
-	defer cancel()
-
-	fmt.Println("========================================")
-	fmt.Println("     KVraft 性能基准测试 (Real Mode)")
-	fmt.Println("========================================")
-	fmt.Println()
-	fmt.Printf("配置: %d 个节点, %d 个客户端, 每个客户端 %d 个请求\n", cfg.Servers, cfg.Clients, cfg.Requests)
-	fmt.Printf("读写比: %.1f%% 读 / %.1f%% 写\n", cfg.ReadRatio*100, (1-cfg.ReadRatio)*100)
-	fmt.Printf("key 空间: %d\n", cfg.Keys)
-	fmt.Println()
-
-	startTime := time.Now()
-	res, err := RunRealBenchmark(ctx, cfg)
-	if err != nil && err != context.DeadlineExceeded {
-		fmt.Printf("错误: %v\n", err)
-		return
-	}
-
-	fmt.Println()
-	fmt.Println("========== 基准测试结果 ==========")
-	fmt.Printf("总请求数: %d\n", res.TotalRequests)
-	if res.TotalRequests > 0 {
-		fmt.Printf("成功请求: %d (%.1f%%)\n", res.SuccessRequests, float64(res.SuccessRequests)*100/float64(res.TotalRequests))
-		fmt.Printf("失败请求: %d (%.1f%%)\n", res.FailedRequests, float64(res.FailedRequests)*100/float64(res.TotalRequests))
-		fmt.Printf("读请求: %d (%.1f%%)\n", res.ReadRequests, float64(res.ReadRequests)*100/float64(res.TotalRequests))
-		fmt.Printf("写请求: %d (%.1f%%)\n", res.WriteRequests, float64(res.WriteRequests)*100/float64(res.TotalRequests))
-	}
-	fmt.Println()
-	fmt.Printf("完整时间: %v\n", res.Duration)
-	if res.Duration.Seconds() > 0 {
-		fmt.Printf("吞吐: %.2f ops/s\n", float64(res.SuccessRequests)/res.Duration.Seconds())
-	}
-	fmt.Println()
-	fmt.Printf("延迟统计:\n")
-	fmt.Printf("  最小: %.2f ms\n", res.MinLatency.Seconds()*1000)
-	fmt.Printf("  最大: %.2f ms\n", res.MaxLatency.Seconds()*1000)
-	fmt.Printf("  平均: %.2f ms\n", res.AvgLatency.Seconds()*1000)
-	fmt.Println()
-	fmt.Printf("总耗时: %v\n", time.Since(startTime))
-	fmt.Println("========================================")
-}
-
-func runBenchmark() {
 	servers := flag.Int("servers", 3, "KVraft 集群节点数")
 	clients := flag.Int("clients", 10, "并发客户端数")
 	requests := flag.Int("requests", 1000, "每个客户端的请求数")

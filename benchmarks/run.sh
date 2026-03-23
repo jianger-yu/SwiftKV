@@ -17,6 +17,29 @@ NUM_CLIENTS="${NUM_CLIENTS:-10}"
 NUM_REQUESTS="${NUM_REQUESTS:-10000}"
 DURATION="${DURATION:-30s}"
 READ_RATIO="${READ_RATIO:-0.5}"
+NUM_KEYS="${NUM_KEYS:-10000}"
+
+# 由节点列表推导集群节点数（例如 a,b,c -> 3）
+SERVER_COUNT=$(awk -F',' '{print NF}' <<< "$TARGET_NODES")
+if [[ -z "$SERVER_COUNT" || "$SERVER_COUNT" -le 0 ]]; then
+    SERVER_COUNT=3
+fi
+
+# 兼容旧的 workload 配置，自动覆盖 read-ratio
+case "$BENCHMARK_TYPE" in
+    read)
+        EFFECTIVE_READ_RATIO="1.0"
+        ;;
+    write)
+        EFFECTIVE_READ_RATIO="0.0"
+        ;;
+    mixed)
+        EFFECTIVE_READ_RATIO="$READ_RATIO"
+        ;;
+    *)
+        EFFECTIVE_READ_RATIO="$READ_RATIO"
+        ;;
+esac
 
 # 颜色输出
 RED='\033[0;31m'
@@ -38,7 +61,7 @@ fi
 # 编译 benchmark 工具
 echo -e "${YELLOW}[1/3] 编译 benchmark 工具...${NC}"
 cd "$PROJECT_DIR"
-go build -o benchmarks/benchmark ./benchmarks/benchmark.go
+go build -o benchmarks/benchmark ./benchmarks
 if [ $? -eq 0 ]; then
     echo -e "${GREEN}✓ 编译成功${NC}"
 else
@@ -52,19 +75,18 @@ echo ""
 echo -e "${YELLOW}[2/3] 运行 Benchmark...${NC}"
 echo "  工作负载类型: $BENCHMARK_TYPE"
 echo "  目标节点: $TARGET_NODES"
+echo "  集群节点数: $SERVER_COUNT"
 echo "  并发客户端: $NUM_CLIENTS"
+echo "  每客户端请求数: $NUM_REQUESTS"
 echo "  运行时间: $DURATION"
 
-# 提取第一个节点作为目标
-FIRST_NODE=$(echo "$TARGET_NODES" | cut -d',' -f1)
-
 "$PROJECT_DIR/benchmarks/benchmark" \
-    -nodes "$FIRST_NODE" \
-    -workload "$BENCHMARK_TYPE" \
+    -servers "$SERVER_COUNT" \
     -clients "$NUM_CLIENTS" \
+    -requests "$NUM_REQUESTS" \
     -duration "$DURATION" \
-    -keys 10000 \
-    -read-ratio "$READ_RATIO"
+    -keys "$NUM_KEYS" \
+    -read-ratio "$EFFECTIVE_READ_RATIO"
 
 BENCHMARK_EXIT=$?
 

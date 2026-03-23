@@ -43,7 +43,6 @@ type KVServer struct {
 }
 
 type ServerStats struct {
-	mu             sync.RWMutex
 	TotalRequests  int64
 	TotalWrites    int64
 	TotalReads     int64
@@ -349,47 +348,38 @@ func (kv *KVServer) killed() bool {
 // ============================================================
 
 func (s *ServerStats) RecordRead() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.TotalRequests++
-	s.TotalReads++
+	atomic.AddInt64(&s.TotalRequests, 1)
+	atomic.AddInt64(&s.TotalReads, 1)
 }
 
 func (s *ServerStats) RecordWrite() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.TotalRequests++
-	s.TotalWrites++
+	atomic.AddInt64(&s.TotalRequests, 1)
+	atomic.AddInt64(&s.TotalWrites, 1)
 }
 
 func (s *ServerStats) RecordCacheHit() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.CacheHits++
+	atomic.AddInt64(&s.CacheHits, 1)
 }
 
 func (s *ServerStats) RecordCacheMiss() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.CacheMisses++
+	atomic.AddInt64(&s.CacheMisses, 1)
 }
 
 func (s *ServerStats) RecordFailure() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.FailedRequests++
+	atomic.AddInt64(&s.FailedRequests, 1)
 }
 
 func (s *ServerStats) RecordWatchNotify() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.WatchNotifies++
+	atomic.AddInt64(&s.WatchNotifies, 1)
 }
 
 func (s *ServerStats) GetStats() (requests, writes, reads, failures, hits, misses int64) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.TotalRequests, s.TotalWrites, s.TotalReads, s.FailedRequests, s.CacheHits, s.CacheMisses
+	return atomic.LoadInt64(&s.TotalRequests),
+		atomic.LoadInt64(&s.TotalWrites),
+		atomic.LoadInt64(&s.TotalReads),
+		atomic.LoadInt64(&s.FailedRequests),
+		atomic.LoadInt64(&s.CacheHits),
+		atomic.LoadInt64(&s.CacheMisses)
 }
 
 // ============================================================

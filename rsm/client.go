@@ -24,6 +24,7 @@ type Clerk struct {
 	grpcServers []string
 	leader      int // 最近成功 leader 在 grpcServers 中的索引
 	hasher      *sharding.ConsistentHash
+	router      *sharding.ShardRouter
 	serverToIdx map[string]int
 
 	mu      sync.Mutex
@@ -55,6 +56,25 @@ func MakeClerk(servers []string) *Clerk {
 		_, _ = ck.getClient(s)
 	}
 	return ck
+}
+
+// MakeShardedClerk 创建基于分组路由器的 Clerk。
+// 该模式下每个请求按 key 定位 group，并在组内自动故障切换。
+func MakeShardedClerk(cfg sharding.ShardingConfig) (*Clerk, error) {
+	router, err := sharding.NewShardRouter(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	ck := &Clerk{
+		leader:      0,
+		hasher:      nil,
+		router:      router,
+		serverToIdx: map[string]int{},
+		conns:       map[string]*grpc.ClientConn{},
+		clients:     map[string]pb.KVServiceClient{},
+	}
+	return ck, nil
 }
 
 func toGRPCAddress(raftAddr string) string {
@@ -209,6 +229,23 @@ func mapPBErr(errText string) kvraftapi.Err {
 // args 和 reply 的类型（包括它们是否为指针）必须与 RPC 处理函数的
 // 参数的声明类型相匹配。此外，reply 必须作为指针传递。
 func (ck *Clerk) Get(key string) (string, kvraftapi.Tversion, kvraftapi.Err) {
+	if ck.router != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		resp, err := ck.router.GetRoute(ctx, key)
+		if err != nil || resp == nil {
+			return "", 0, kvraftapi.ErrWrongLeader
+		}
+		errCode := mapPBErr(resp.GetError())
+		if errCode == kvraftapi.OK {
+			return resp.GetValue(), kvraftapi.Tversion(resp.GetVersion()), kvraftapi.OK
+		}
+		if errCode == kvraftapi.ErrNoKey {
+			return "", 0, kvraftapi.ErrNoKey
+		}
+		return "", 0, errCode
+	}
+
 	args := kvraftapi.GetArgs{Key: key}
 	timeout := time.After(10 * time.Second)
 	attempts := 0
@@ -287,6 +324,16 @@ func (ck *Clerk) Get(key string) (string, kvraftapi.Tversion, kvraftapi.Err) {
 // args 和 reply 的类型（包括它们是否为指针）必须与 RPC 处理函数的
 // 参数的声明类型相匹配。此外，reply 必须作为指针传递。
 func (ck *Clerk) Put(key string, value string, version kvraftapi.Tversion) kvraftapi.Err {
+	if ck.router != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		resp, err := ck.router.PutRoute(ctx, key, value, int64(version))
+		if err != nil || resp == nil {
+			return kvraftapi.ErrWrongLeader
+		}
+		return mapPBErr(resp.GetError())
+	}
+
 	args := kvraftapi.PutArgs{Key: key, Value: value, Version: version}
 	retry := false
 	timeout := time.After(10 * time.Second)
@@ -358,6 +405,16 @@ func (ck *Clerk) Put(key string, value string, version kvraftapi.Tversion) kvraf
 }
 
 func (ck *Clerk) Delete(key string) kvraftapi.Err {
+	if ck.router != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		resp, err := ck.router.DeleteRoute(ctx, key)
+		if err != nil || resp == nil {
+			return kvraftapi.ErrWrongLeader
+		}
+		return mapPBErr(resp.GetError())
+	}
+
 	timeout := time.After(10 * time.Second)
 	attempts := 0
 
@@ -398,6 +455,10 @@ func (ck *Clerk) Delete(key string) kvraftapi.Err {
 }
 
 func (ck *Clerk) Close() {
+	if ck.router != nil {
+		ck.router.Close()
+	}
+
 	ck.mu.Lock()
 	defer ck.mu.Unlock()
 	for addr, conn := range ck.conns {
