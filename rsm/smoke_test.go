@@ -5,7 +5,6 @@ import (
 	"testing"
 	"time"
 
-	"kvraft/cache"
 	kvraftapi "kvraft/raftkv/rpc"
 	"kvraft/storage"
 	"kvraft/watch"
@@ -26,11 +25,10 @@ func TestBasicPutGet(t *testing.T) {
 	}
 
 	kv := &KVServer{
-		me:       0,
-		dead:     0,
-		store:    store,
-		lruCache: cache.NewLRUCache(10000),
-		stats:    &ServerStats{},
+		me:    0,
+		dead:  0,
+		store: store,
+		stats: &ServerStats{},
 	}
 
 	t.Log("【Step 1】创建 KVServer 实例：✓")
@@ -56,13 +54,7 @@ func TestBasicPutGet(t *testing.T) {
 	t.Log("【Step 2】执行 Put 操作：✓ Key=test_key, Value=test_value")
 
 	// ============================================================
-	// 测试 2: 清空缓存，强制从存储读取
-	// ============================================================
-	kv.lruCache.Clear()
-	t.Log("【Step 3】清空 LRU 缓存，验证真实存储：✓")
-
-	// ============================================================
-	// 测试 3: Get 操作 - 验证数据正确保存
+	// 测试 2: Get 操作 - 验证数据正确保存
 	// ============================================================
 	getArgs := &kvraftapi.GetArgs{
 		Key: "test_key",
@@ -81,7 +73,7 @@ func TestBasicPutGet(t *testing.T) {
 	if getReply.Value != "test_value" {
 		t.Fatalf("❌ Get 返回值不匹配，期望 'test_value'，收到 '%v'", getReply.Value)
 	}
-	t.Log("【Step 4】执行 Get 操作：✓ 返回值正确")
+	t.Log("【Step 3】执行 Get 操作：✓ 返回值正确")
 
 	// ============================================================
 	// 测试 4: 版本控制 - 尝试以错误版本写入
@@ -101,7 +93,7 @@ func TestBasicPutGet(t *testing.T) {
 	if putReply2.Err != kvraftapi.ErrVersion {
 		t.Fatalf("❌ 版本冲突检测失败，期望 ErrVersion，收到 %v", putReply2.Err)
 	}
-	t.Log("【Step 5】验证版本控制：✓ 错误版本正确拒绝")
+	t.Log("【Step 4】验证版本控制：✓ 错误版本正确拒绝")
 
 	// ============================================================
 	// 测试 5: 不存在的 key 读取
@@ -119,7 +111,7 @@ func TestBasicPutGet(t *testing.T) {
 	if getReply2.Err != kvraftapi.ErrNoKey {
 		t.Fatalf("❌ 不存在 key 处理失败，期望 ErrNoKey，收到 %v", getReply2.Err)
 	}
-	t.Log("【Step 6】验证 ErrNoKey：✓ 不存在的 key 正确处理")
+	t.Log("【Step 5】验证 ErrNoKey：✓ 不存在的 key 正确处理")
 
 	// ============================================================
 	// 测试 6: 更新存在的 key
@@ -139,10 +131,7 @@ func TestBasicPutGet(t *testing.T) {
 	if putReply3.Err != kvraftapi.OK {
 		t.Fatalf("❌ 更新 Put 操作失败，Err=%v（期望 OK）", putReply3.Err)
 	}
-	t.Log("【Step 7】执行更新 Put 操作：✓ Key=test_key, Value=updated_value, Version=2")
-
-	// 清空缓存再读取
-	kv.lruCache.Clear()
+	t.Log("【Step 6】执行更新 Put 操作：✓ Key=test_key, Value=updated_value, Version=2")
 
 	getArgs2 := &kvraftapi.GetArgs{
 		Key: "test_key",
@@ -156,7 +145,7 @@ func TestBasicPutGet(t *testing.T) {
 	if getReply4.Value != "updated_value" {
 		t.Fatalf("❌ Get 返回值不匹配，期望 'updated_value'，收到 '%v'", getReply4.Value)
 	}
-	t.Log("【Step 8】验证数据更新：✓ 新值正确保存和读取")
+	t.Log("【Step 7】验证数据更新：✓ 新值正确保存和读取")
 
 	// 清理
 	atomic.StoreInt32(&kv.dead, 1)
@@ -191,12 +180,11 @@ func TestWatchMechanism(t *testing.T) {
 	defer watchMgr.Close()
 
 	kv := &KVServer{
-		me:       0,
-		dead:     0,
-		store:    store,
-		lruCache: cache.NewLRUCache(10000),
-		stats:    &ServerStats{},
-		rsm:      &RSM{watchMgr: watchMgr},
+		me:    0,
+		dead:  0,
+		store: store,
+		stats: &ServerStats{},
+		rsm:   &RSM{watchMgr: watchMgr},
 	}
 
 	t.Log("【Step 1】KVServer 与 Watch.Manager 初始化：✓")

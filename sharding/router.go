@@ -3,7 +3,9 @@ package sharding
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
+	"sort"
 	"sync"
 	"time"
 
@@ -39,6 +41,9 @@ type ShardRouter struct {
 	groupsByID   map[int]RaftGroupConfig
 	leaderCache  map[int]string
 }
+
+// WatchEventHandler 处理来自分片路由层的 Watch 事件。
+type WatchEventHandler func(groupID int, event *pb.WatchEvent)
 
 // NewShardRouter 创建并初始化分片路由器。
 func NewShardRouter(cfg ShardingConfig) (*ShardRouter, error) {
@@ -143,6 +148,18 @@ func (r *ShardRouter) groupForKey(key string) (int, error) {
 	return gid, nil
 }
 
+// GroupIDs 返回当前路由器管理的分组 ID 列表（升序）。
+func (r *ShardRouter) GroupIDs() []int {
+	r.mu.RLock()
+	ids := make([]int, 0, len(r.groupsByID))
+	for gid := range r.groupsByID {
+		ids = append(ids, gid)
+	}
+	r.mu.RUnlock()
+	sort.Ints(ids)
+	return ids
+}
+
 func (r *ShardRouter) isWrongLeader(errText string) bool {
 	if errText == "" {
 		return false
@@ -197,13 +214,8 @@ func (r *ShardRouter) setLeader(gid int, leaderAddr string) {
 	}
 }
 
-// GetRoute 路由 Get 请求。
-func (r *ShardRouter) GetRoute(ctx context.Context, key string) (*pb.GetResponse, error) {
-	gid, err := r.groupForKey(key)
-	if err != nil {
-		return nil, err
-	}
-
+// GetFromGroup 在指定分组内执行 Get。
+func (r *ShardRouter) GetFromGroup(ctx context.Context, gid int, key string) (*pb.GetResponse, error) {
 	var lastErr error
 	for _, replica := range r.groupReplicaCandidates(gid) {
 		r.mu.RLock()
@@ -240,13 +252,8 @@ func (r *ShardRouter) GetRoute(ctx context.Context, key string) (*pb.GetResponse
 	return nil, lastErr
 }
 
-// PutRoute 路由 Put 请求。
-func (r *ShardRouter) PutRoute(ctx context.Context, key string, value string, version int64) (*pb.PutResponse, error) {
-	gid, err := r.groupForKey(key)
-	if err != nil {
-		return nil, err
-	}
-
+// PutToGroup 在指定分组内执行 Put。
+func (r *ShardRouter) PutToGroup(ctx context.Context, gid int, key string, value string, version int64) (*pb.PutResponse, error) {
 	var lastErr error
 	for _, replica := range r.groupReplicaCandidates(gid) {
 		r.mu.RLock()
@@ -283,13 +290,8 @@ func (r *ShardRouter) PutRoute(ctx context.Context, key string, value string, ve
 	return nil, lastErr
 }
 
-// DeleteRoute 路由 Delete 请求。
-func (r *ShardRouter) DeleteRoute(ctx context.Context, key string) (*pb.DeleteResponse, error) {
-	gid, err := r.groupForKey(key)
-	if err != nil {
-		return nil, err
-	}
-
+// DeleteFromGroup 在指定分组内执行 Delete。
+func (r *ShardRouter) DeleteFromGroup(ctx context.Context, gid int, key string) (*pb.DeleteResponse, error) {
 	var lastErr error
 	for _, replica := range r.groupReplicaCandidates(gid) {
 		r.mu.RLock()
@@ -324,6 +326,219 @@ func (r *ShardRouter) DeleteRoute(ctx context.Context, key string) (*pb.DeleteRe
 		lastErr = fmt.Errorf("no available replica for group %d", gid)
 	}
 	return nil, lastErr
+}
+
+// ScanGroup 在指定分组内执行 Scan。
+func (r *ShardRouter) ScanGroup(ctx context.Context, gid int, prefix string, limit int32) ([]*pb.KeyValue, error) {
+	var lastErr error
+	for _, replica := range r.groupReplicaCandidates(gid) {
+		r.mu.RLock()
+		client := r.groupClients[gid][replica]
+		r.mu.RUnlock()
+		if client == nil {
+			continue
+		}
+
+		reqCtx, cancel := r.withRequestTimeout(ctx)
+		resp, rpcErr := client.Scan(reqCtx, &pb.ScanRequest{Prefix: prefix, Limit: limit})
+		cancel()
+
+		if rpcErr != nil {
+			lastErr = rpcErr
+			continue
+		}
+		if resp == nil {
+			lastErr = fmt.Errorf("empty scan response from %s", replica)
+			continue
+		}
+		if r.isWrongLeader(resp.GetError()) {
+			lastErr = fmt.Errorf("group %d wrong leader via %s", gid, replica)
+			continue
+		}
+
+		r.setLeader(gid, replica)
+		return resp.GetItems(), nil
+	}
+
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no available replica for group %d", gid)
+	}
+	return nil, lastErr
+}
+
+// GetRoute 路由 Get 请求。
+func (r *ShardRouter) GetRoute(ctx context.Context, key string) (*pb.GetResponse, error) {
+	gid, err := r.groupForKey(key)
+	if err != nil {
+		return nil, err
+	}
+	return r.GetFromGroup(ctx, gid, key)
+}
+
+// PutRoute 路由 Put 请求。
+func (r *ShardRouter) PutRoute(ctx context.Context, key string, value string, version int64) (*pb.PutResponse, error) {
+	gid, err := r.groupForKey(key)
+	if err != nil {
+		return nil, err
+	}
+	return r.PutToGroup(ctx, gid, key, value, version)
+}
+
+// DeleteRoute 路由 Delete 请求。
+func (r *ShardRouter) DeleteRoute(ctx context.Context, key string) (*pb.DeleteResponse, error) {
+	gid, err := r.groupForKey(key)
+	if err != nil {
+		return nil, err
+	}
+	return r.DeleteFromGroup(ctx, gid, key)
+}
+
+// ScanRoute 跨分片执行 Scan 并合并结果（按 key 排序）。
+func (r *ShardRouter) ScanRoute(ctx context.Context, prefix string, limit int32) ([]*pb.KeyValue, error) {
+	gids := r.GroupIDs()
+	if len(gids) == 0 {
+		return nil, fmt.Errorf("no groups configured")
+	}
+
+	all := make([]*pb.KeyValue, 0)
+	for _, gid := range gids {
+		items, err := r.ScanGroup(ctx, gid, prefix, 0)
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, items...)
+	}
+
+	sort.Slice(all, func(i, j int) bool {
+		if all[i].GetKey() == all[j].GetKey() {
+			return all[i].GetVersion() < all[j].GetVersion()
+		}
+		return all[i].GetKey() < all[j].GetKey()
+	})
+
+	if limit > 0 && len(all) > int(limit) {
+		all = all[:limit]
+	}
+	return all, nil
+}
+
+func (r *ShardRouter) watchGroupsFor(key string, prefix bool) ([]int, error) {
+	if !prefix {
+		gid, err := r.groupForKey(key)
+		if err != nil {
+			return nil, err
+		}
+		return []int{gid}, nil
+	}
+	gids := r.GroupIDs()
+	if len(gids) == 0 {
+		return nil, fmt.Errorf("no groups configured")
+	}
+	return gids, nil
+}
+
+func (r *ShardRouter) watchSingleGroup(ctx context.Context, gid int, key string, prefix bool, handler WatchEventHandler) error {
+	var lastErr error
+
+	for {
+		if ctx.Err() != nil {
+			return nil
+		}
+
+		candidates := r.groupReplicaCandidates(gid)
+		if len(candidates) == 0 {
+			lastErr = fmt.Errorf("group %d has no available replica", gid)
+			select {
+			case <-time.After(200 * time.Millisecond):
+				continue
+			case <-ctx.Done():
+				return nil
+			}
+		}
+
+		for _, replica := range candidates {
+			r.mu.RLock()
+			client := r.groupClients[gid][replica]
+			r.mu.RUnlock()
+			if client == nil {
+				continue
+			}
+
+			stream, err := client.Watch(ctx)
+			if err != nil {
+				lastErr = err
+				continue
+			}
+
+			if err := stream.Send(&pb.WatchRequest{RequestType: &pb.WatchRequest_Create{Create: &pb.WatchCreateRequest{Key: key, Prefix: prefix}}}); err != nil {
+				lastErr = err
+				continue
+			}
+
+			r.setLeader(gid, replica)
+
+			for {
+				ev, recvErr := stream.Recv()
+				if recvErr == nil {
+					if handler != nil && ev != nil {
+						handler(gid, ev)
+					}
+					continue
+				}
+
+				if recvErr == io.EOF || ctx.Err() != nil {
+					return nil
+				}
+
+				lastErr = recvErr
+				break
+			}
+		}
+
+		if lastErr != nil {
+			select {
+			case <-time.After(150 * time.Millisecond):
+			case <-ctx.Done():
+				return nil
+			}
+		}
+	}
+}
+
+// WatchRoute 按分片隔离监听。
+// prefix=false 时仅监听 key 所在分片；prefix=true 时监听所有分片并聚合事件。
+func (r *ShardRouter) WatchRoute(ctx context.Context, key string, prefix bool, handler WatchEventHandler) error {
+	gids, err := r.watchGroupsFor(key, prefix)
+	if err != nil {
+		return err
+	}
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, len(gids))
+
+	for _, gid := range gids {
+		groupID := gid
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if werr := r.watchSingleGroup(ctx, groupID, key, prefix, handler); werr != nil {
+				errCh <- werr
+			}
+		}()
+	}
+
+	wg.Wait()
+	close(errCh)
+
+	if ctx.Err() != nil {
+		return nil
+	}
+	for e := range errCh {
+		if e != nil {
+			return e
+		}
+	}
+	return nil
 }
 
 // BatchGet 按分组并发拉取多个 key。

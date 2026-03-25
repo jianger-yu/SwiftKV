@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -72,8 +74,35 @@ func (s *testKVService) Delete(_ context.Context, req *pb.DeleteRequest) (*pb.De
 	return &pb.DeleteResponse{Error: "OK"}, nil
 }
 
-func (s *testKVService) Scan(_ context.Context, _ *pb.ScanRequest) (*pb.ScanResponse, error) {
-	return &pb.ScanResponse{Error: "OK"}, nil
+func (s *testKVService) Scan(_ context.Context, req *pb.ScanRequest) (*pb.ScanResponse, error) {
+	if s.alwaysWrongLeader {
+		return &pb.ScanResponse{Error: "ErrWrongLeader"}, nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	prefix := req.GetPrefix()
+	keys := make([]string, 0, len(s.kv))
+	for k := range s.kv {
+		if prefix == "" || strings.HasPrefix(k, prefix) {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+
+	limit := int(req.GetLimit())
+	if limit <= 0 || limit > len(keys) {
+		limit = len(keys)
+	}
+
+	items := make([]*pb.KeyValue, 0, limit)
+	for i := 0; i < limit; i++ {
+		kv := s.kv[keys[i]]
+		items = append(items, &pb.KeyValue{Key: kv.GetKey(), Value: kv.GetValue(), Version: kv.GetVersion()})
+	}
+
+	return &pb.ScanResponse{Items: items, Error: "OK"}, nil
 }
 
 func (s *testKVService) Watch(_ grpc.BidiStreamingServer[pb.WatchRequest, pb.WatchEvent]) error {
@@ -238,5 +267,58 @@ func TestShardRouterBatchGet(t *testing.T) {
 	}
 	if miss := results["missing-key"]; miss == nil || miss.GetError() != "ErrNoKey" {
 		t.Fatalf("missing key response mismatch: %+v", miss)
+	}
+}
+
+func TestShardRouterScanRoute(t *testing.T) {
+	s1 := &testKVService{kv: map[string]*pb.KeyValue{}}
+	a1, stop1 := startTestKVServer(t, s1)
+	defer stop1()
+
+	s2 := &testKVService{kv: map[string]*pb.KeyValue{}}
+	a2, stop2 := startTestKVServer(t, s2)
+	defer stop2()
+
+	r, err := NewShardRouter(ShardingConfig{
+		Groups: []RaftGroupConfig{
+			{GroupID: 1, Replicas: []string{a1}, LeaderIdx: 0},
+			{GroupID: 2, Replicas: []string{a2}, LeaderIdx: 0},
+		},
+		VirtualNodeCount: 64,
+		ConnectTimeout:   2 * time.Second,
+		RequestTimeout:   1200 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("new shard router failed: %v", err)
+	}
+	defer r.Close()
+
+	ctx := context.Background()
+	k1 := findKeyForGroup(t, r, 1, "scan-user")
+	k2 := findKeyForGroup(t, r, 2, "scan-user")
+	k3 := findKeyForGroup(t, r, 1, "scan-order")
+
+	_, _ = r.PutRoute(ctx, k1, "v1", 0)
+	_, _ = r.PutRoute(ctx, k2, "v2", 0)
+	_, _ = r.PutRoute(ctx, k3, "v3", 0)
+
+	items, err := r.ScanRoute(ctx, "scan-user", 0)
+	if err != nil {
+		t.Fatalf("scan route failed: %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("scan route count mismatch, want=2 got=%d", len(items))
+	}
+
+	if !(strings.HasPrefix(items[0].GetKey(), "scan-user") && strings.HasPrefix(items[1].GetKey(), "scan-user")) {
+		t.Fatalf("scan route returned unexpected keys: %+v", items)
+	}
+
+	limited, err := r.ScanRoute(ctx, "scan-", 1)
+	if err != nil {
+		t.Fatalf("scan route(limit) failed: %v", err)
+	}
+	if len(limited) != 1 {
+		t.Fatalf("scan route(limit) count mismatch, want=1 got=%d", len(limited))
 	}
 }

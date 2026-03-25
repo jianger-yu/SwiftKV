@@ -2,7 +2,6 @@ package rsm
 
 import (
 	"encoding/gob"
-	"kvraft/cache"
 	kvraftapi "kvraft/raftkv/rpc"
 	"kvraft/storage"
 	"kvraft/watch"
@@ -12,11 +11,13 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"google.golang.org/grpc"
 )
 
 // ============================================================
 // KVServer - 高性能分布式键值存储服务器
-// 集成特性：LRU 缓存、Watch 实时推送、性能统计
+// 集成特性：BadgerDB 存储、Watch 实时推送、性能统计
 // ============================================================
 
 type OperationInfo struct {
@@ -32,14 +33,16 @@ type OperationInfo struct {
 }
 
 type KVServer struct {
-	me       int
-	dead     int32
-	address  string
-	rsm      *RSM
-	mu       sync.RWMutex
-	store    *storage.Store
-	lruCache *cache.LRUCache
-	stats    *ServerStats
+	me      int
+	dead    int32
+	address string
+	rsm     *RSM
+	mu      sync.RWMutex
+	store   *storage.Store
+	stats   *ServerStats
+	rpcLn   net.Listener
+	grpcLn  net.Listener
+	grpcSrv *grpc.Server
 }
 
 type ServerStats struct {
@@ -47,8 +50,6 @@ type ServerStats struct {
 	TotalWrites    int64
 	TotalReads     int64
 	FailedRequests int64
-	CacheHits      int64
-	CacheMisses    int64
 	WatchNotifies  int64
 }
 
@@ -79,23 +80,13 @@ func (kv *KVServer) DoOp(req any) any {
 	}
 }
 
-// doGet - 读优化：缓存优先级最高
+// doGet - 直接从 BadgerDB 读取（其 BlockCache 提供缓存功能）
 func (kv *KVServer) doGet(args *kvraftapi.GetArgs) kvraftapi.GetReply {
 	if kv.killed() {
 		return kvraftapi.GetReply{Err: kvraftapi.ErrWrongLeader}
 	}
 
-	// 缓存查询（最快路径）
-	if val, version, ok := kv.lruCache.GetWithVersion(args.Key); ok {
-		kv.stats.RecordCacheHit()
-		return kvraftapi.GetReply{
-			Value:   val,
-			Version: kvraftapi.Tversion(version),
-			Err:     kvraftapi.OK,
-		}
-	}
-
-	// 存储查询
+	// 存储查询（BadgerDB 的 BlockCache 会处理热数据缓存）
 	value, version, exists, err := kv.store.Get(args.Key)
 	if err != nil {
 		log.Printf("[KVServer-%d] Get error: %v", kv.me, err)
@@ -104,8 +95,6 @@ func (kv *KVServer) doGet(args *kvraftapi.GetArgs) kvraftapi.GetReply {
 	}
 
 	if exists {
-		kv.lruCache.PutWithVersion(args.Key, value, version)
-		kv.stats.RecordCacheMiss()
 		return kvraftapi.GetReply{
 			Value:   value,
 			Version: kvraftapi.Tversion(version),
@@ -113,7 +102,6 @@ func (kv *KVServer) doGet(args *kvraftapi.GetArgs) kvraftapi.GetReply {
 		}
 	}
 
-	kv.stats.RecordCacheMiss()
 	return kvraftapi.GetReply{Err: kvraftapi.ErrNoKey}
 }
 
@@ -123,7 +111,8 @@ func (kv *KVServer) doPut(args *kvraftapi.PutArgs) kvraftapi.PutReply {
 		return kvraftapi.PutReply{Err: kvraftapi.ErrWrongLeader}
 	}
 
-	_, version, exists, err := kv.store.Get(args.Key)
+	// 获取当前值，用于Watch事件
+	oldValue, version, exists, err := kv.store.Get(args.Key)
 	if err != nil {
 		log.Printf("[KVServer-%d] Get error during Put: %v", kv.me, err)
 		kv.stats.RecordFailure()
@@ -138,9 +127,9 @@ func (kv *KVServer) doPut(args *kvraftapi.PutArgs) kvraftapi.PutReply {
 				kv.stats.RecordFailure()
 				return kvraftapi.PutReply{Err: kvraftapi.ErrWrongLeader}
 			}
-			kv.lruCache.PutWithVersion(args.Key, args.Value, newVersion)
 			kv.stats.RecordWrite()
-			return kvraftapi.PutReply{Err: kvraftapi.OK}
+			// 返回修改前的值
+			return kvraftapi.PutReply{Err: kvraftapi.OK, OldValue: oldValue}
 		}
 		kv.stats.RecordFailure()
 		return kvraftapi.PutReply{Err: kvraftapi.ErrVersion}
@@ -152,9 +141,9 @@ func (kv *KVServer) doPut(args *kvraftapi.PutArgs) kvraftapi.PutReply {
 			kv.stats.RecordFailure()
 			return kvraftapi.PutReply{Err: kvraftapi.ErrWrongLeader}
 		}
-		kv.lruCache.PutWithVersion(args.Key, args.Value, 1)
 		kv.stats.RecordWrite()
-		return kvraftapi.PutReply{Err: kvraftapi.OK}
+		// 新键，OldValue为空
+		return kvraftapi.PutReply{Err: kvraftapi.OK, OldValue: ""}
 	}
 
 	kv.stats.RecordFailure()
@@ -182,7 +171,6 @@ func (kv *KVServer) doDelete(args *kvraftapi.DeleteArgs) kvraftapi.DeleteReply {
 		return kvraftapi.DeleteReply{Err: kvraftapi.ErrWrongLeader}
 	}
 
-	kv.lruCache.Delete(args.Key)
 	kv.stats.RecordWrite()
 	return kvraftapi.DeleteReply{Err: kvraftapi.OK}
 }
@@ -207,12 +195,8 @@ func (kv *KVServer) Snapshot() []byte {
 }
 
 func (kv *KVServer) Restore(data []byte) {
-	kv.lruCache.Clear()
-
 	if len(data) == 0 {
-		if err := kv.store.Clear(); err != nil {
-			log.Printf("[KVServer-%d] Clear store error: %v", kv.me, err)
-		}
+		// 空快照表示没有可恢复内容，不应清空已有持久化数据。
 		return
 	}
 
@@ -303,17 +287,12 @@ func (kv *KVServer) notifyPutEvent(putArgs *kvraftapi.PutArgs, result any, watch
 	}
 
 	if putReply.Err == kvraftapi.OK {
-		kv.mu.RLock()
-		oldValue, _, exists, _ := kv.store.Get(putArgs.Key)
-		kv.mu.RUnlock()
-
-		oldValueStr := ""
-		if exists {
-			oldValueStr = oldValue
-		}
+		// 从PutReply中直接获取OldValue，避免在Put后再次读取导致获取到新值的问题
+		oldValueStr := putReply.OldValue
 
 		eventType := "PUT"
-		if !exists {
+		if oldValueStr == "" {
+			// 如果OldValue为空，说明这是新key（version 0的Put）
 			eventType = "SET"
 		}
 
@@ -337,6 +316,23 @@ func (kv *KVServer) notifyPutEvent(putArgs *kvraftapi.PutArgs, result any, watch
 
 func (kv *KVServer) Kill() {
 	atomic.StoreInt32(&kv.dead, 1)
+	if kv.grpcSrv != nil {
+		kv.grpcSrv.Stop()
+	}
+	if kv.grpcLn != nil {
+		_ = kv.grpcLn.Close()
+	}
+	if kv.rpcLn != nil {
+		_ = kv.rpcLn.Close()
+	}
+	if kv.rsm != nil {
+		kv.rsm.Close()
+	}
+	if kv.store != nil {
+		if err := kv.store.Close(); err != nil {
+			log.Printf("[KVServer-%d] close store error: %v", kv.me, err)
+		}
+	}
 }
 
 func (kv *KVServer) killed() bool {
@@ -357,14 +353,6 @@ func (s *ServerStats) RecordWrite() {
 	atomic.AddInt64(&s.TotalWrites, 1)
 }
 
-func (s *ServerStats) RecordCacheHit() {
-	atomic.AddInt64(&s.CacheHits, 1)
-}
-
-func (s *ServerStats) RecordCacheMiss() {
-	atomic.AddInt64(&s.CacheMisses, 1)
-}
-
 func (s *ServerStats) RecordFailure() {
 	atomic.AddInt64(&s.FailedRequests, 1)
 }
@@ -373,13 +361,11 @@ func (s *ServerStats) RecordWatchNotify() {
 	atomic.AddInt64(&s.WatchNotifies, 1)
 }
 
-func (s *ServerStats) GetStats() (requests, writes, reads, failures, hits, misses int64) {
+func (s *ServerStats) GetStats() (requests, writes, reads, failures int64) {
 	return atomic.LoadInt64(&s.TotalRequests),
 		atomic.LoadInt64(&s.TotalWrites),
 		atomic.LoadInt64(&s.TotalReads),
-		atomic.LoadInt64(&s.FailedRequests),
-		atomic.LoadInt64(&s.CacheHits),
-		atomic.LoadInt64(&s.CacheMisses)
+		atomic.LoadInt64(&s.FailedRequests)
 }
 
 // ============================================================
@@ -398,11 +384,10 @@ func StartKVServer(servers []string, gid int, me int, persister Persister, maxra
 	}
 
 	kv := &KVServer{
-		me:       me,
-		address:  address,
-		store:    store,
-		lruCache: cache.NewLRUCache(10000),
-		stats:    &ServerStats{},
+		me:      me,
+		address: address,
+		store:   store,
+		stats:   &ServerStats{},
 	}
 
 	kv.rsm = MakeRSM(servers, me, persister, maxraftstate, kv)
@@ -419,6 +404,7 @@ func StartKVServer(servers []string, gid int, me int, persister Persister, maxra
 	if e != nil {
 		log.Fatal(e)
 	}
+	kv.rpcLn = l
 
 	go func() {
 		for !kv.killed() {
@@ -433,7 +419,7 @@ func StartKVServer(servers []string, gid int, me int, persister Persister, maxra
 	}()
 
 	// 对外业务接口迁移到 gRPC（Raft 复制仍使用 RPC）。
-	startGRPCServer(kv, address)
+	kv.grpcSrv, kv.grpcLn = startGRPCServer(kv, address)
 
 	return kv
 }

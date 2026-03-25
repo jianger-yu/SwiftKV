@@ -68,6 +68,9 @@ type Raft struct {
 
 	applyCh chan raftapi.ApplyMsg
 
+	heartbeatInterval time.Duration
+	replicateTrigger  chan struct{}
+
 	lastIncludedIndex int
 	lastIncludedTerm  int
 
@@ -543,7 +546,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Command: command,
 	})
 	rf.persist()
-	go rf.sendHeartbeats()
+	// 新日志到达时触发一次快速复制，避免每次 Start 都创建复制 goroutine。
+	select {
+	case rf.replicateTrigger <- struct{}{}:
+	default:
+	}
 	// 4. 立即返回（不等提交）
 	return index, term, true
 }
@@ -838,10 +845,13 @@ func (rf *Raft) sendHeartbeats() {
 
 func (rf *Raft) leaderLoop() {
 	go func() {
-		ticker := time.NewTicker(50 * time.Millisecond)
+		ticker := time.NewTicker(rf.heartbeatInterval)
 		defer ticker.Stop()
 		for rf.killed() == false {
-			<-ticker.C
+			select {
+			case <-ticker.C:
+			case <-rf.replicateTrigger:
+			}
 			rf.mu.Lock()
 			if rf.state != Leader {
 				rf.mu.Unlock()
@@ -1023,6 +1033,8 @@ func Make(peers []string, me int,
 
 	rf.applyCh = applyCh
 	rf.rpcClients = make(map[string]*rpc.Client, len(peers))
+	rf.heartbeatInterval = 80 * time.Millisecond
+	rf.replicateTrigger = make(chan struct{}, 1)
 
 	// 你的初始化代码在这里 (3A, 3B, 3C)。
 

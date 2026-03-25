@@ -79,6 +79,30 @@ type RSM struct {
 	opListener OpCompleteListener // 操作完成监听器（用于 Watch 回调）
 }
 
+// Close 优雅关闭 RSM 相关后台组件。
+func (rsm *RSM) Close() {
+	if !rsm.shutdown.CompareAndSwap(false, true) {
+		return
+	}
+
+	if rsm.rf != nil {
+		rsm.rf.Kill()
+	}
+	if rsm.watchMgr != nil {
+		rsm.watchMgr.Close()
+	}
+
+	rsm.mu.Lock()
+	defer rsm.mu.Unlock()
+	for _, wop := range rsm.waitingOps {
+		select {
+		case wop.done <- false:
+		default:
+		}
+	}
+	rsm.waitingOps = make(map[int]*waitingOp)
+}
+
 // servers[] contains the ports of the set of
 // servers that will cooperate via Raft to
 // form the fault-tolerant key/value service.

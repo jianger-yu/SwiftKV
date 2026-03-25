@@ -29,7 +29,8 @@ type PutArgs struct {
 }
 
 type PutReply struct {
-	Err Err
+	Err      Err
+	OldValue string // 修改前的值（用于Watch事件）
 }
 
 type DeleteArgs struct {

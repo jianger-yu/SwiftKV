@@ -15,6 +15,15 @@ NC='\033[0m' # No Color
 SERVERS_COUNT=3
 BASE_PORT=5001
 SERVERS=""
+CLEAN_DATA=0
+
+for arg in "$@"; do
+    case "$arg" in
+        --clean)
+            CLEAN_DATA=1
+            ;;
+    esac
+done
 
 # 构建服务器列表
 for ((i=0; i<SERVERS_COUNT; i++)); do
@@ -45,12 +54,18 @@ for ((i=0; i<SERVERS_COUNT; i++)); do
         sleep 1
     fi
 
-    # 清理 Badger 本地目录，避免 LOCK 残留导致启动失败
+    # 持久化数据默认保留；仅在 --clean 时删除数据目录。
     DB_DIR="badger-127.0.0.1:$PORT"
-    if [ -d "$DB_DIR" ]; then
+    if [ "$CLEAN_DATA" -eq 1 ] && [ -d "$DB_DIR" ]; then
         rm -rf "$DB_DIR"
     fi
 done
+
+if [ "$CLEAN_DATA" -eq 1 ]; then
+    echo -e "${YELLOW}已启用 --clean：启动前会清理 badger-* 数据目录${NC}"
+else
+    echo -e "${GREEN}默认保留 badger-* 数据目录（支持重启后恢复）${NC}"
+fi
 
 # 创建临时目录用于日志和 PID 文件
 WORK_DIR="/tmp/kvraft_$$"

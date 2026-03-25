@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,6 +31,19 @@ type Clerk struct {
 	mu      sync.Mutex
 	conns   map[string]*grpc.ClientConn
 	clients map[string]pb.KVServiceClient
+}
+
+// WatchSubscription 表示一个可取消的 Watch 订阅。
+type WatchSubscription struct {
+	Events <-chan *pb.WatchEvent
+	cancel context.CancelFunc
+}
+
+// Cancel 主动取消订阅。
+func (s *WatchSubscription) Cancel() {
+	if s != nil && s.cancel != nil {
+		s.cancel()
+	}
 }
 
 func MakeClerk(servers []string) *Clerk {
@@ -107,9 +121,9 @@ func (ck *Clerk) getClient(addr string) (pb.KVServiceClient, error) {
 		target,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{
-			Time:                30 * time.Second,
+			Time:                2 * time.Minute,
 			Timeout:             3 * time.Second,
-			PermitWithoutStream: true,
+			PermitWithoutStream: false,
 		}),
 	)
 	if err != nil {
@@ -452,6 +466,148 @@ func (ck *Clerk) Delete(key string) kvraftapi.Err {
 
 		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+// Scan 按前缀扫描键值。
+func (ck *Clerk) Scan(prefix string, limit int32) ([]*pb.KeyValue, kvraftapi.Err) {
+	if ck.router != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		items, err := ck.router.ScanRoute(ctx, prefix, limit)
+		if err != nil {
+			return nil, kvraftapi.ErrWrongLeader
+		}
+		return items, kvraftapi.OK
+	}
+
+	timeout := time.After(10 * time.Second)
+	attempts := 0
+
+	for {
+		select {
+		case <-timeout:
+			return nil, kvraftapi.ErrWrongLeader
+		default:
+		}
+
+		for _, index := range ck.preferredCandidates(prefix) {
+			addr := ck.grpcServers[index]
+			client, err := ck.getClient(addr)
+			if err != nil {
+				attempts++
+				continue
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+			resp, rpcErr := client.Scan(ctx, &pb.ScanRequest{Prefix: prefix, Limit: limit})
+			cancel()
+			if rpcErr == nil && resp != nil {
+				errCode := mapPBErr(resp.GetError())
+				if errCode == kvraftapi.OK {
+					ck.leader = index
+					items := append([]*pb.KeyValue(nil), resp.GetItems()...)
+					sort.Slice(items, func(i, j int) bool {
+						return items[i].GetKey() < items[j].GetKey()
+					})
+					return items, kvraftapi.OK
+				}
+			}
+
+			attempts++
+			if attempts > 100 {
+				return nil, kvraftapi.ErrWrongLeader
+			}
+		}
+
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func (ck *Clerk) watchSingleServer(ctx context.Context, addr string, key string, prefix bool, out chan<- *pb.WatchEvent) error {
+	client, err := ck.getClient(addr)
+	if err != nil {
+		return err
+	}
+
+	stream, err := client.Watch(ctx)
+	if err != nil {
+		return err
+	}
+
+	if err := stream.Send(&pb.WatchRequest{RequestType: &pb.WatchRequest_Create{Create: &pb.WatchCreateRequest{Key: key, Prefix: prefix}}}); err != nil {
+		return err
+	}
+
+	for {
+		ev, recvErr := stream.Recv()
+		if recvErr != nil {
+			return recvErr
+		}
+		if ev == nil {
+			continue
+		}
+
+		select {
+		case out <- ev:
+		case <-ctx.Done():
+			return nil
+		}
+	}
+}
+
+// Watch 订阅指定 key 或 prefix 的变化。
+// prefix=false 时仅监听一个 key；prefix=true 时监听指定前缀。
+func (ck *Clerk) Watch(key string, prefix bool) (*WatchSubscription, error) {
+	ctx, cancel := context.WithCancel(context.Background())
+	out := make(chan *pb.WatchEvent, 128)
+
+	if ck.router != nil {
+		go func() {
+			defer close(out)
+			_ = ck.router.WatchRoute(ctx, key, prefix, func(groupID int, event *pb.WatchEvent) {
+				if event == nil {
+					return
+				}
+				ev := *event
+				ev.EventType = fmt.Sprintf("group-%d:%s", groupID, event.GetEventType())
+				select {
+				case out <- &ev:
+				case <-ctx.Done():
+				}
+			})
+		}()
+		return &WatchSubscription{Events: out, cancel: cancel}, nil
+	}
+
+	go func() {
+		defer close(out)
+		for {
+			if ctx.Err() != nil {
+				return
+			}
+
+			candidates := ck.preferredCandidates(key)
+			for _, index := range candidates {
+				if ctx.Err() != nil {
+					return
+				}
+
+				addr := ck.grpcServers[index]
+				err := ck.watchSingleServer(ctx, addr, key, prefix, out)
+				if err == nil || ctx.Err() != nil {
+					return
+				}
+			}
+
+			select {
+			case <-time.After(200 * time.Millisecond):
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	return &WatchSubscription{Events: out, cancel: cancel}, nil
 }
 
 func (ck *Clerk) Close() {

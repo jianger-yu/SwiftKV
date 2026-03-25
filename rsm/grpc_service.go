@@ -15,6 +15,7 @@ import (
 	"kvraft/watch"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/keepalive"
 )
 
 // grpcKVService 将现有 KVServer 能力暴露为 gRPC 接口。
@@ -139,57 +140,64 @@ func (s *grpcKVService) Watch(stream grpc.BidiStreamingServer[pb.WatchRequest, p
 	}
 
 	var currentID int64
-	var eventCh <-chan pb.WatchEvent
-	stop := make(chan struct{})
+	var currentStop chan struct{}
 
-	// 后台将 Watch manager 事件转发到 gRPC 流。
-	go func() {
-		for {
-			select {
-			case <-stop:
-				return
-			case ev, ok := <-eventCh:
-				if !ok {
-					return
-				}
-				_ = stream.Send(&ev)
-			}
+	stopCurrent := func() {
+		if currentStop != nil {
+			close(currentStop)
+			currentStop = nil
 		}
-	}()
-	defer close(stop)
+		if currentID != 0 {
+			_ = watchMgr.Unsubscribe(currentID)
+			currentID = 0
+		}
+	}
+	defer stopCurrent()
 
 	for {
 		req, err := stream.Recv()
 		if err != nil {
-			if currentID != 0 {
-				_ = watchMgr.Unsubscribe(currentID)
-			}
+			stopCurrent()
 			return nil
 		}
 
 		switch t := req.GetRequestType().(type) {
 		case *pb.WatchRequest_Create:
+			// 同一流内重复 Create 时，先清理旧订阅，确保仅保留当前订阅。
+			stopCurrent()
+
 			w, subErr := watchMgr.Subscribe(t.Create.GetKey(), t.Create.GetPrefix())
 			if subErr != nil {
 				_ = stream.Send(&pb.WatchEvent{EventType: "error", NewValue: subErr.Error()})
 				continue
 			}
 			currentID = w.ID
-			ch := make(chan pb.WatchEvent, 64)
-			eventCh = ch
-			go func(src <-chan watch.Event, dst chan<- pb.WatchEvent, watchID int64) {
-				defer close(dst)
-				for e := range src {
-					dst <- pb.WatchEvent{
-						WatchId:    watchID,
-						Key:        e.Key,
-						OldValue:   e.OldValue,
-						NewValue:   e.NewValue,
-						NewVersion: e.NewVersion,
-						EventType:  strings.ToLower(e.EventType),
+
+			stopCh := make(chan struct{})
+			currentStop = stopCh
+			go func(src <-chan watch.Event, watchID int64, stop <-chan struct{}) {
+				for {
+					select {
+					case <-stop:
+						return
+					case e, ok := <-src:
+						if !ok {
+							return
+						}
+						ev := &pb.WatchEvent{
+							WatchId:    watchID,
+							Key:        e.Key,
+							OldValue:   e.OldValue,
+							NewValue:   e.NewValue,
+							NewVersion: e.NewVersion,
+							EventType:  strings.ToLower(e.EventType),
+						}
+						if sendErr := stream.Send(ev); sendErr != nil {
+							return
+						}
 					}
 				}
-			}(w.Channel, ch, w.ID)
+			}(w.Channel, w.ID, stopCh)
 		case *pb.WatchRequest_Cancel:
 			id := t.Cancel.GetWatchId()
 			if id == 0 {
@@ -198,6 +206,11 @@ func (s *grpcKVService) Watch(stream grpc.BidiStreamingServer[pb.WatchRequest, p
 			if id != 0 {
 				_ = watchMgr.Unsubscribe(id)
 			}
+			if currentStop != nil {
+				close(currentStop)
+				currentStop = nil
+			}
+			currentID = 0
 			return nil
 		}
 	}
@@ -214,13 +227,22 @@ func (s *grpcKVService) GetClusterStatus(ctx context.Context, req *pb.ClusterSta
 	}, nil
 }
 
-func startGRPCServer(kv *KVServer, rpcAddr string) {
+func startGRPCServer(kv *KVServer, rpcAddr string) (*grpc.Server, net.Listener) {
 	grpcAddr := grpcAddrFromRPC(rpcAddr)
 	lis, err := net.Listen("tcp", grpcAddr)
 	if err != nil {
 		log.Fatalf("start grpc listener %s failed: %v", grpcAddr, err)
 	}
-	gs := grpc.NewServer()
+	gs := grpc.NewServer(
+		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+			MinTime:             10 * time.Second,
+			PermitWithoutStream: true,
+		}),
+		grpc.KeepaliveParams(keepalive.ServerParameters{
+			Time:    2 * time.Minute,
+			Timeout: 20 * time.Second,
+		}),
+	)
 	pb.RegisterKVServiceServer(gs, &grpcKVService{kv: kv})
 	go func() {
 		if serveErr := gs.Serve(lis); serveErr != nil {
@@ -230,4 +252,5 @@ func startGRPCServer(kv *KVServer, rpcAddr string) {
 
 	// 避免服务刚启动时客户端短暂拨号失败。
 	time.Sleep(20 * time.Millisecond)
+	return gs, lis
 }
