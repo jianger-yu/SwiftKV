@@ -18,11 +18,12 @@ import (
 
 // BenchmarkConfig 描述压测配置。
 type BenchmarkConfig struct {
-	Servers   int     // 集群节点数
-	Clients   int     // 并发客户端数
-	Requests  int     // 每个客户端的请求数
-	ReadRatio float64 // 读请求比例 (0.0 - 1.0)
-	Keys      int     // key 空间大小
+	Servers   int           // 集群节点数
+	Clients   int           // 并发客户端数
+	Requests  int           // 每个客户端的请求数
+	ReadRatio float64       // 读请求比例 (0.0 - 1.0)
+	Keys      int           // key 空间大小
+	Duration  time.Duration // 压测阶段最长时长
 }
 
 // BenchmarkResult 汇总压测结果。
@@ -30,6 +31,8 @@ type BenchmarkResult struct {
 	TotalRequests   int64
 	ReadRequests    int64
 	WriteRequests   int64
+	WriteOKRequests int64
+	WriteConflicts  int64
 	SuccessRequests int64
 	FailedRequests  int64
 	Duration        time.Duration
@@ -60,6 +63,9 @@ func RunRealBenchmark(ctx context.Context, cfg BenchmarkConfig) (BenchmarkResult
 	}
 	if cfg.ReadRatio < 0 || cfg.ReadRatio > 1 {
 		cfg.ReadRatio = 0.7
+	}
+	if cfg.Duration <= 0 {
+		cfg.Duration = 30 * time.Second
 	}
 
 	// 1. 构建服务器地址列表
@@ -172,9 +178,16 @@ func RunRealBenchmark(ctx context.Context, cfg BenchmarkConfig) (BenchmarkResult
 		workerClerks[i] = rsm.MakeClerk(servers)
 	}
 
-	// 创建新的context用于压测，不受初始化时间影响
-	benchCtx, benchCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// 压测阶段的时间预算应只受 cfg.Duration 控制，避免外层 deadline 在预热阶段耗尽。
+	benchCtx, benchCancel := context.WithTimeout(context.Background(), cfg.Duration)
 	defer benchCancel()
+	go func() {
+		select {
+		case <-ctx.Done():
+			benchCancel()
+		case <-benchCtx.Done():
+		}
+	}()
 
 	start := time.Now()
 
@@ -187,6 +200,8 @@ func RunRealBenchmark(ctx context.Context, cfg BenchmarkConfig) (BenchmarkResult
 
 			var localRead int64
 			var localWrite int64
+			var localWriteOK int64
+			var localWriteConflicts int64
 			var localSuccess int64
 			var localFailed int64
 			var localLatencySum time.Duration
@@ -211,8 +226,20 @@ func RunRealBenchmark(ctx context.Context, cfg BenchmarkConfig) (BenchmarkResult
 					localRead++
 				} else {
 					value := fmt.Sprintf("value-%d-%d", id, i)
-					errCode = workerClerk.Put(key, value, 0)
+					_, version, getErr := workerClerk.Get(key)
+					if getErr == kvraftapi.OK {
+						errCode = workerClerk.Put(key, value, version)
+					} else if getErr == kvraftapi.ErrNoKey {
+						errCode = workerClerk.Put(key, value, 0)
+					} else {
+						errCode = getErr
+					}
 					localWrite++
+					if errCode == kvraftapi.OK {
+						localWriteOK++
+					} else if errCode == kvraftapi.ErrVersion {
+						localWriteConflicts++
+					}
 				}
 
 				latency := time.Since(opStart)
@@ -225,10 +252,6 @@ func RunRealBenchmark(ctx context.Context, cfg BenchmarkConfig) (BenchmarkResult
 					localMaxLatency = latency
 				}
 
-				// 成功条件：返回OK、ErrNoKey或ErrVersion都算成功
-				// OK: 正常成功
-				// ErrNoKey: 读取的key不存在（支持的）
-				// ErrVersion: 写入的版本不匹配（并发冲突被正确处理，算成功）
 				if errCode == kvraftapi.OK || errCode == kvraftapi.ErrNoKey || errCode == kvraftapi.ErrVersion {
 					localSuccess++
 				} else {
@@ -239,6 +262,8 @@ func RunRealBenchmark(ctx context.Context, cfg BenchmarkConfig) (BenchmarkResult
 			mu.Lock()
 			res.ReadRequests += localRead
 			res.WriteRequests += localWrite
+			res.WriteOKRequests += localWriteOK
+			res.WriteConflicts += localWriteConflicts
 			res.SuccessRequests += localSuccess
 			res.FailedRequests += localFailed
 			totalLatency += localLatencySum
@@ -257,6 +282,9 @@ func RunRealBenchmark(ctx context.Context, cfg BenchmarkConfig) (BenchmarkResult
 	elapsed := time.Since(start)
 	res.Duration = elapsed
 	res.TotalRequests = res.ReadRequests + res.WriteRequests
+	if res.TotalRequests == 0 {
+		fmt.Printf("警告: 压测阶段未执行任何请求 (bench-duration=%v, init-duration=%v, parent-ctx-err=%v)\n", cfg.Duration, initDuration, ctx.Err())
+	}
 
 	// 6. 计算平均延迟
 	if latencySamples > 0 {
@@ -296,9 +324,10 @@ func main() {
 		Requests:  *requests,
 		ReadRatio: *readRatio,
 		Keys:      *keys,
+		Duration:  *duration,
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), *duration)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	fmt.Println("========================================")
@@ -330,6 +359,10 @@ func main() {
 	fmt.Printf("完整时间: %v\n", res.Duration)
 	if res.Duration.Seconds() > 0 {
 		fmt.Printf("吞吐: %.2f ops/s\n", float64(res.SuccessRequests)/res.Duration.Seconds())
+		fmt.Printf("OK 写入吞吐: %.2f ops/s\n", float64(res.WriteOKRequests)/res.Duration.Seconds())
+	}
+	if res.WriteRequests > 0 {
+		fmt.Printf("写入冲突率: %.2f%%\n", float64(res.WriteConflicts)*100/float64(res.WriteRequests))
 	}
 	fmt.Println()
 	fmt.Printf("延迟统计:\n")

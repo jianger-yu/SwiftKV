@@ -171,11 +171,6 @@ func (rf *Raft) getTerm(index int) int {
 
 // 将 Raft 的持久状态保存到稳定存储中，
 // 以便在崩溃并重启后能够恢复。
-// 参见论文图 2，了解需要持久化的内容。
-// 在你尚未实现快照前，应当传递 nil 作为
-// persister.Save() 的第二个参数。
-// 在实现快照后，应传递当前快照
-// （若尚无快照，则传 nil）。
 func (rf *Raft) persist() {
 	// 你的代码在这里 (3C)。
 	// 示例：
@@ -201,22 +196,10 @@ func (rf *Raft) persist() {
 
 // 恢复先前持久化的状态。
 func (rf *Raft) readPersist(data []byte) {
-	if data == nil || len(data) < 1 { // 没有任何状态时启动？
+	if data == nil || len(data) < 1 { // 没有任何状态时启动
 		return
 	}
-	// 你的代码在这里 (3C)。
-	// 示例：
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+
 	r := bytes.NewBuffer(data)
 	d := gob.NewDecoder(r)
 
@@ -312,26 +295,22 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.persistWithSnapshot(snapshot)
 }
 
-// RequestVote RPC 参数结构体示例。
-// 字段名必须以大写字母开头！
+// RequestVote RPC 参数结构体
 type RequestVoteArgs struct {
-	// 你的数据在这里 (3A, 3B)。
 	Term         int // candidate的任期号
 	CandidateId  int // 发起投票的candidate的ID
 	LastLogIndex int // candidate的最高日志条目索引
 	LastLogTerm  int // candidate的最高日志条目的任期号
 }
 
-// RequestVote RPC 回复结构体示例。
-// 字段名必须以大写字母开头！
+// RequestVote RPC 回复结构体
 type RequestVoteReply struct {
 	Term        int  // 服务器的当前任期号，让candidate更新自己
 	VoteGranted bool // 如果是true，意味着candidate收到了选票
 }
 
-// RequestVote RPC 处理函数示例。
+// RequestVote RPC 处理函数
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) error {
-	// 你的代码在这里 (3A, 3B)。
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -452,16 +431,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// ---（第 6 步）删除冲突日志（同 index 不同 term）---
 	// 从第一个冲突点开始删除
 	i := 0
-	// for ; i < len(args.Entries); i++ {
-	// 	if args.PrevLogIndex+1+i >= len(rf.log) {
-	// 		break
-	// 	}
-	// 	if args.Entries[i].Term != rf.log[args.PrevLogIndex+1+i].Term {
-	// 		rf.log = rf.log[:args.PrevLogIndex+1+i]
-	// 		rf.persist()
-	// 		break
-	// 	}
-	// }
 	for ; i < len(args.Entries); i++ {
 		index := args.PrevLogIndex + 1 + i
 
@@ -500,29 +469,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	return nil
 }
 
-// 向某个服务器发送 RequestVote RPC 的示例代码。
-// server 是 rf.peers[] 中目标服务器的索引。
-// 期望 RPC 参数存放于 args 中。
-// *reply 用于填充 RPC 回复，因此调用者应传入 &reply。
-// 传递给 Call() 的参数类型必须与
-// 处理函数中声明的参数类型相同（包括是否为指针）。
-//
-// labrpc 包模拟了一个不可靠的网络，服务器可能无法访问，
-// 请求和回复可能会丢失。
-// Call() 发送一个请求并等待回复。如果在超时时间内收到回复，
-// 则返回 true；否则返回 false。
-// 因此 Call() 可能会等待一段时间。
-// 返回 false 的原因可能包括服务器宕机、服务器无法访问、
-// 请求丢失或回复丢失。
-//
-// 除非服务器端的处理函数未返回，否则 Call() 保证会返回
-// （可能会有延迟）。因此无需在 Call() 外层再实现超时机制。
-//
-// 更多细节请查看 ../labrpc/labrpc.go 中的注释。
-//
-// 如果 RPC 无法正常工作，请检查：
-// ① 传递到 RPC 的结构体字段是否首字母大写；
-// ② 调用者是否使用 &reply 传入结构体地址，而不是传结构体值。
+// 向某个服务器发送 RequestVote RPC 的示例
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.callPeer(server, "Raft.RequestVote", args, reply)
 	return ok
@@ -961,7 +908,6 @@ func (rf *Raft) startElection() {
 func (rf *Raft) ticker() {
 	for rf.killed() == false {
 
-		// 你的代码在这里 (3A)
 		// 检查是否需要发起领导者选举。
 		needStart := false
 		rf.mu.Lock()
@@ -1058,8 +1004,6 @@ func Make(peers []string, me int,
 	rf.replicateTrigger = make(chan struct{}, 1)
 	rf.leaseRatio = 1.5
 	rf.leaseUntil = time.Now()
-
-	// 你的初始化代码在这里 (3A, 3B, 3C)。
 
 	// 从崩溃前的持久化状态中恢复
 	rf.readPersist(persister.ReadRaftState())
