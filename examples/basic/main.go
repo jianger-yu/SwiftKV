@@ -6,8 +6,8 @@ import (
 	"net/rpc"
 	"time"
 
-	kvapi "kvraft/raftkv/rpc"
-	"kvraft/rsm"
+	kvapi "kvraft/pkg/raftapi"
+	"kvraft/pkg/rsm"
 )
 
 var demoKeyPrefix = fmt.Sprintf("demo:%d:", time.Now().UnixNano())

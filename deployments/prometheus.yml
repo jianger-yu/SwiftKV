@@ -1,0 +1,102 @@
+# ============================================================
+# Prometheus 配置文件
+# 用于监控 KVraft 集群的性能指标
+# ============================================================
+
+global:
+  scrape_interval: 15s        # 全局抓取间隔
+  evaluation_interval: 15s    # 评估告警规则的间隔
+  external_labels:
+    cluster: 'kvraft-cluster'
+    environment: 'production'
+
+# 告警规则文件
+rule_files:
+  - /etc/prometheus/alert.rules.yml
+
+# 服务发现和抓取配置
+scrape_configs:
+  # Prometheus 本身的指标
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # ============================================================
+  # KVraft 节点指标 - 静态配置
+  # ============================================================
+
+  - job_name: 'kvraft-node-0'
+    static_configs:
+      - targets: ['kvraft-node-0:9100']
+        labels:
+          node_id: '0'
+          raft_group: '0'
+    metrics_path: '/metrics'
+    scrape_interval: 10s
+    scrape_timeout: 5s
+
+  - job_name: 'kvraft-node-1'
+    static_configs:
+      - targets: ['kvraft-node-1:9100']
+        labels:
+          node_id: '1'
+          raft_group: '0'
+    metrics_path: '/metrics'
+    scrape_interval: 10s
+    scrape_timeout: 5s
+
+  - job_name: 'kvraft-node-2'
+    static_configs:
+      - targets: ['kvraft-node-2:9100']
+        labels:
+          node_id: '2'
+          raft_group: '0'
+    metrics_path: '/metrics'
+    scrape_interval: 10s
+    scrape_timeout: 5s
+
+  # ============================================================
+  # Redis 对标准服务（用于性能对比）
+  # ============================================================
+
+  - job_name: 'redis'
+    static_configs:
+      - targets: ['redis:6379']
+    metrics_path: '/metrics'
+    scrape_interval: 15s
+
+  # ============================================================
+  # Consul 服务发现（可选）
+  # ============================================================
+
+  - job_name: 'consul'
+    consul_sd_configs:
+      - server: 'consul:8500'
+    relabel_configs:
+      - source_labels: [__meta_consul_service]
+        target_label: service
+      - source_labels: [__meta_consul_node]
+        target_label: node
+
+# ============================================================
+# 告警管理配置
+# ============================================================
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: []
+
+# ============================================================
+# 远程存储配置（可选）
+# ============================================================
+
+# remote_write:
+#   - url: "http://remote-storage:9009/api/v1/push"
+#     queue_config:
+#       capacity: 10000
+#       max_shards: 200
+#       min_shards: 1
+
+# remote_read:
+#   - url: "http://remote-storage:9009/api/v1/read"

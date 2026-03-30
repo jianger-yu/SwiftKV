@@ -6,10 +6,11 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 
-	"kvraft/rsm"
+	"kvraft/pkg/rsm"
 )
 
 func main() {
@@ -61,7 +62,7 @@ func main() {
 	fmt.Println()
 
 	// 创建持久化器（基于文件系统，支持重启后恢复）
-	raftDataDir := "badger-" + address
+	raftDataDir := filepath.Join("data", "badger-"+address)
 	persister, err := rsm.NewFilePersister(raftDataDir)
 	if err != nil {
 		log.Fatalf("创建持久化器失败: %v", err)

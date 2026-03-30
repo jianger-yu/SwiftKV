@@ -65,7 +65,7 @@ fi
 
 if [[ ${RUN_TEST} -eq 1 ]]; then
     echo "=== 1/4 Run tests ==="
-    go test ./...
+    bash scripts/test-all.sh
 else
     echo "=== 1/4 Skip tests (--no-test) ==="
 fi
@@ -86,15 +86,11 @@ PATHS=(
     prometheus.yml
     api
     cmd
+    docs
+    deployments
     examples
-    raft
-    raftapi
-    raftkv
-    rsm
-    sharding
-    storage
-    wal
-    watch
+    pkg
+    scripts
 )
 
 for path in "${PATHS[@]}"; do
@@ -109,9 +105,12 @@ fi
 if [[ -f "benchmarks/run.sh" ]]; then
     git add "benchmarks/run.sh"
 fi
+if [[ -f "cmd/benchmarks/benchmark.go" ]]; then
+    git add "cmd/benchmarks/benchmark.go"
+fi
 
-# Avoid committing local benchmark binary artifacts.
-git reset -q -- benchmarks/benchmark 2>/dev/null || true
+# Avoid committing local benchmark/runtime artifacts.
+git reset -q -- benchmarks/benchmark cmd/benchmarks/benchmark data 2>/dev/null || true
 
 if git diff --cached --quiet; then
     echo "No staged source changes. Nothing to commit."

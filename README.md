@@ -58,6 +58,25 @@ go run examples/scenarios/main.go
 go run cmd/kvcli/main.go -servers 127.0.0.1:5001,127.0.0.1:5002,127.0.0.1:5003
 ```
 
+## 推荐使用方式
+
+日常开发建议按这个顺序：
+
+1. 启动集群
+	- `bash examples/start_cluster.sh --clean`
+2. 功能验证
+	- `go run examples/basic/main.go`
+	- `go run cmd/kvcli/main.go -servers 127.0.0.1:5001,127.0.0.1:5002,127.0.0.1:5003`
+3. 全量测试（精简输出）
+	- `bash scripts/test-all.sh`
+4. 性能压测
+	- `go build -o ./benchmarks/benchmark ./benchmarks/benchmark.go`
+	- `./benchmarks/benchmark --servers=3 --clients=10 --duration=30s --maxraftstate=1048576 --sharded=true`
+5. 提交推送
+	- `bash push-to-github.sh -m "your message"`
+
+说明：`push-to-github.sh` 已接入 `scripts/test-all.sh`，测试输出只保留关键包状态和关键报错行。
+
 ## 架构概览
 
 - `raft/`：Raft 共识（选主、日志复制、提交）
@@ -94,10 +113,16 @@ go run cmd/kvcli/main.go -servers 127.0.0.1:5001,127.0.0.1:5002,127.0.0.1:5003
 
 ## 测试与验证
 
-建议至少执行核心链路测试：
+推荐执行全量测试（精简输出）：
 
 ```bash
-go test ./rsm ./watch ./sharding -v
+bash scripts/test-all.sh
+```
+
+如果你需要原始详细输出：
+
+```bash
+go test ./...
 ```
 
 ## Docker 说明

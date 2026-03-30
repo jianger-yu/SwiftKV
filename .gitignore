@@ -68,6 +68,15 @@ docker-volumes/
 # 生成的可执行文件（测试用）
 test-*
 *-test
+cmd/benchmarks/benchmark
+cmd/benchmark-params/benchmark-params
+cmd/server/server
+cmd/kvcli/kvcli
+cmd/kvmigrate/kvmigrate
+
+# 运行时数据目录
+data/**
+!data/.gitkeep
 
 # Proto 编译中间文件
 *.pb.go.bak

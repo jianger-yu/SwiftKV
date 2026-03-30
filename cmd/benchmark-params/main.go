@@ -5,11 +5,12 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
-	kvraftapi "kvraft/raftkv/rpc"
-	"kvraft/rsm"
+	kvraftapi "kvraft/pkg/raftapi"
+	"kvraft/pkg/rsm"
 )
 
 // ============================================================
@@ -172,6 +173,10 @@ var testScenarios = []TestScenario{
 	},
 }
 
+func benchmarkDataDir(addr string) string {
+	return filepath.Join("data", "badger-"+addr)
+}
+
 // ============================================================
 // 执行基准测试
 // ============================================================
@@ -193,7 +198,7 @@ func runBenchmark(params BenchmarkParams, scenario TestScenario) (*BenchResult, 
 	// 准备数据目录（自动清理）
 	for i := 0; i < scenario.Servers; i++ {
 		addr := fmt.Sprintf("127.0.0.1:%d", 15000+i)
-		_ = os.RemoveAll("badger-" + addr)
+		_ = os.RemoveAll(benchmarkDataDir(addr))
 	}
 
 	// 启动集群
@@ -207,7 +212,7 @@ func runBenchmark(params BenchmarkParams, scenario TestScenario) (*BenchResult, 
 	persisters := make([]rsm.Persister, scenario.Servers)
 
 	for i := 0; i < scenario.Servers; i++ {
-		p, err := rsm.NewFilePersister("badger-" + servers[i])
+		p, err := rsm.NewFilePersister(benchmarkDataDir(servers[i]))
 		if err != nil {
 			return nil, fmt.Errorf("创建 persister %d 失败: %w", i, err)
 		}
@@ -246,7 +251,7 @@ func runBenchmark(params BenchmarkParams, scenario TestScenario) (*BenchResult, 
 	// 清理数据
 	for i := 0; i < scenario.Servers; i++ {
 		addr := fmt.Sprintf("127.0.0.1:%d", 15000+i)
-		_ = os.RemoveAll("badger-" + addr)
+		_ = os.RemoveAll(benchmarkDataDir(addr))
 	}
 
 	fmt.Println(" OK")

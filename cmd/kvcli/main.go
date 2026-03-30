@@ -13,9 +13,9 @@ import (
 	"time"
 
 	pb "kvraft/api/pb/kvraft/api/pb"
-	kvraftapi "kvraft/raftkv/rpc"
-	"kvraft/rsm"
-	"kvraft/sharding"
+	kvraftapi "kvraft/pkg/raftapi"
+	"kvraft/pkg/rsm"
+	"kvraft/pkg/sharding"
 )
 
 type jsonGroup struct {

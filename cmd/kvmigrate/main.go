@@ -8,7 +8,7 @@ import (
 	"os"
 	"time"
 
-	"kvraft/sharding"
+	"kvraft/pkg/sharding"
 )
 
 type jsonGroup struct {

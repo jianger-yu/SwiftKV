@@ -7,12 +7,13 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
-	"kvraft/rsm"
+	"kvraft/pkg/rsm"
 )
 
 func getenvInt(name string, def int) int {
@@ -33,6 +34,17 @@ func getenvStr(name string, def string) string {
 		return def
 	}
 	return raw
+}
+
+func runtimeDataRoot() string {
+	v := strings.TrimSpace(os.Getenv("KV_DATA_DIR"))
+	if v != "" {
+		return v
+	}
+	if info, err := os.Stat("/data"); err == nil && info.IsDir() {
+		return "/data"
+	}
+	return "data"
 }
 
 func startHTTP(addr string, kv *rsm.KVServer) *http.Server {
@@ -113,7 +125,7 @@ func main() {
 	metricsAddr := getenvStr("METRICS_LISTEN", "0.0.0.0:9100")
 	maxRaftState := getenvInt("MAX_RAFT_STATE", -1)
 
-	dataDir := fmt.Sprintf("/data/node-%d", nodeID)
+	dataDir := filepath.Join(runtimeDataRoot(), fmt.Sprintf("node-%d", nodeID))
 	persister, err := rsm.NewFilePersister(dataDir)
 	if err != nil {
 		log.Fatalf("create persister failed: %v", err)

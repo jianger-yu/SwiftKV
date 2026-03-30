@@ -7,8 +7,8 @@ import (
 	"sync"
 	"time"
 
-	kvapi "kvraft/raftkv/rpc"
-	"kvraft/rsm"
+	kvapi "kvraft/pkg/raftapi"
+	"kvraft/pkg/rsm"
 )
 
 var scenarioKeyPrefix = fmt.Sprintf("scenario:%d:", time.Now().UnixNano())
