@@ -12,7 +12,6 @@ import (
 
 	"kvraft/pkg/raft"
 	kvraftapi "kvraft/pkg/raftapi"
-	raftapi "kvraft/pkg/raftapi"
 	"kvraft/pkg/wal"
 	"kvraft/pkg/watch"
 )
@@ -70,8 +69,8 @@ type waitingOp struct {
 type RSM struct {
 	mu           sync.Mutex
 	me           int
-	rf           raftapi.Raft
-	applyCh      chan raftapi.ApplyMsg
+	rf           kvraftapi.Raft
+	applyCh      chan kvraftapi.ApplyMsg
 	maxraftstate int // snapshot if log grows this big
 	sm           StateMachine
 	persister    raft.Persister
@@ -139,7 +138,7 @@ func MakeRSM(
 	rsm := &RSM{
 		me:           me,
 		maxraftstate: maxraftstate,
-		applyCh:      make(chan raftapi.ApplyMsg),
+		applyCh:      make(chan kvraftapi.ApplyMsg),
 		sm:           sm,
 		persister:    persister,
 		idCounter:    0,
@@ -179,7 +178,7 @@ func (rsm *RSM) genID() int64 {
 	return atomic.AddInt64(&rsm.idCounter, 1)
 }
 
-func (rsm *RSM) Raft() raftapi.Raft {
+func (rsm *RSM) Raft() kvraftapi.Raft {
 	return rsm.rf
 }
 
@@ -362,7 +361,7 @@ func (rsm *RSM) applyLoop() {
 	}
 }
 
-func (rsm *RSM) applyCommand(msg raftapi.ApplyMsg) {
+func (rsm *RSM) applyCommand(msg kvraftapi.ApplyMsg) {
 	oper, ok := msg.Command.(Op)
 	if !ok {
 		// 非法的操作类型，忽略
@@ -414,7 +413,7 @@ func (rsm *RSM) applyCommand(msg raftapi.ApplyMsg) {
 	}
 }
 
-func (rsm *RSM) applySnapshot(msg raftapi.ApplyMsg) {
+func (rsm *RSM) applySnapshot(msg kvraftapi.ApplyMsg) {
 	if rsm.shutdown.Load() {
 		return
 	}
