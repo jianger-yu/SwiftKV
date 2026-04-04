@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
-COMMIT_MSG="optimization: add comments"
+COMMIT_MSG="optimization: modify comments"
 RUN_TEST=1
 DRY_RUN=0
 

@@ -366,7 +366,6 @@ func (ck *Clerk) Put(key string, value string, version kvraftapi.Tversion) kvraf
 		case <-timeout:
 			fmt.Println("\n⚠️  写入操作超时（10秒）")
 			fmt.Println("提示: 请确保 KVraft 服务器已启动:")
-			fmt.Println("  bash examples/start_cluster.sh")
 			return kvraftapi.ErrWrongLeader
 		default:
 		}
@@ -416,7 +415,6 @@ func (ck *Clerk) Put(key string, value string, version kvraftapi.Tversion) kvraf
 			if attempts > 100 {
 				fmt.Printf("\n⚠️  Put 已尝试 %d 次，仍无可用服务器\n", attempts)
 				fmt.Println("提示: 请确保 KVraft 服务器已启动:")
-				fmt.Println("  bash examples/start_cluster.sh")
 				return kvraftapi.ErrWrongLeader
 			}
 		}
