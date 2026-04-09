@@ -210,13 +210,12 @@ func checkLinearizabilityWithOracle(ops []*linearOp) (bool, []string) {
 func runLinearizabilityScenario(t *testing.T, cfg *linearizabilityConfig) {
 	t.Helper()
 
-	storePath := fmt.Sprintf("test-db-linear-%d", time.Now().UnixNano())
+	storePath := rsmTestStorePath(t, fmt.Sprintf("test-db-linear-%d", time.Now().UnixNano()))
 	store, err := storage.NewStore(storePath)
 	if err != nil {
 		t.Fatalf("create store failed: %v", err)
 	}
 	defer func() {
-		_ = store.Clear()
 		_ = store.Close()
 	}()
 

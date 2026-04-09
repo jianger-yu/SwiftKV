@@ -62,14 +62,8 @@ func NewStore(dbPath string) (*Store, error) {
 	}, nil
 }
 
-// Get 从存储中读取一个键的值和版本
-func (s *Store) Get(key string) (value string, version uint64, exists bool, err error) {
-	value, version, _, exists, err = s.GetWithMeta(key)
-	return
-}
-
-// GetWithMeta returns value/version and raw expiry timestamp.
-func (s *Store) GetWithMeta(key string) (value string, version uint64, expires int64, exists bool, err error) {
+// Get returns value/version/raw expiry timestamp for a key.
+func (s *Store) Get(key string) (value string, version uint64, expires int64, exists bool, err error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -102,13 +96,8 @@ func (s *Store) GetWithMeta(key string) (value string, version uint64, expires i
 	return
 }
 
-// Put 将一个键值对存储到持久化存储中
-func (s *Store) Put(key, value string, version uint64) error {
-	return s.PutWithTTL(key, value, version, 0)
-}
-
-// PutWithTTL stores key/value/version with optional absolute expiry unix nano.
-func (s *Store) PutWithTTL(key, value string, version uint64, expires int64) error {
+// Put stores key/value/version with optional absolute expiry unix nano.
+func (s *Store) Put(key, value string, version uint64, expires int64) error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -283,8 +272,9 @@ func (s *Store) LoadSnapshot(snapshotData []byte) error {
 		return fmt.Errorf("反序列化快照失败: %w", err)
 	}
 
-	tmpPath := fmt.Sprintf("%s.restore.%d", s.dbPath, time.Now().UnixNano())
-	backupPath := fmt.Sprintf("%s.backup.%d", s.dbPath, time.Now().UnixNano())
+	ts := time.Now().UnixNano()
+	tmpPath := fmt.Sprintf("%s.restore.%d", s.dbPath, ts)
+	backupPath := fmt.Sprintf("%s.backup.%d", s.dbPath, ts)
 
 	if err := os.RemoveAll(tmpPath); err != nil {
 		return fmt.Errorf("清理临时恢复目录失败: %w", err)

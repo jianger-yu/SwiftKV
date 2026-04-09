@@ -33,15 +33,15 @@ func absoluteExpiryFromTTL(ttlSeconds int64, now int64) int64 {
 // KVServer - 高性能分布式键值存储服务器
 
 type OperationInfo struct {
-	Type       string
-	Key        string
-	OldValue   string
-	NewValue   string
-	OldVersion int64
-	NewVersion int64
-	Timestamp  time.Time
-	Success    bool
-	Error      kvraftapi.Err
+	Type       string        // 操作类型：GET、PUT、DELETE、SCAN、EXPIRE 等
+	Key        string        // 操作的键名
+	OldValue   string        // 操作执行前的值
+	NewValue   string        // 操作执行后的值
+	OldVersion int64         // 操作执行前的版本号
+	NewVersion int64         // 操作执行后的版本号
+	Timestamp  time.Time     // 操作的时间戳
+	Success    bool          // 操作是否执行成功
+	Error      kvraftapi.Err // 操作的错误码
 }
 
 type KVServer struct {
@@ -54,12 +54,13 @@ type KVServer struct {
 	stats            *ServerStats   // 统计器指针
 	leaseStatEnabled bool           // 控制是否开启昂贵的租约统计逻辑
 	ttlEvery         time.Duration  // 定义后台清理过期键的频率
-	ttlBatch         int            //定义每次清理任务最多删除多少个键，防止长时间占用 CPU
+	ttlBatch         int            // 定义每次清理任务最多删除多少个键，防止长时间占用 CPU
 	rpcLn            net.Listener   // 网络监听器,用于节点间 Raft 通信
 	grpcLn           net.Listener   // 网络监听器,用于外部客户端 gRPC 接入
 	grpcSrv          *grpc.Server   // gRPC 服务实例
 }
 
+// 决定是否开启“租约统计”
 func leaseStatsEnabledFromEnv() bool {
 	v := strings.TrimSpace(strings.ToLower(os.Getenv("KV_LEASE_STATS")))
 	return v == "1" || v == "true" || v == "yes" || v == "on"
@@ -77,14 +78,14 @@ func runtimeDataRoot() string {
 }
 
 type ServerStats struct {
-	TotalRequests  int64
-	TotalWrites    int64
-	TotalReads     int64
-	FailedRequests int64
-	WatchNotifies  int64
-	LeaseHits      int64
-	LeaseFallbacks int64
-	TTLExpiredOps  int64
+	TotalRequests  int64 // 总请求数（读写请求总和）
+	TotalWrites    int64 // 总写操作数
+	TotalReads     int64 // 总读操作数
+	FailedRequests int64 // 失败请求数
+	WatchNotifies  int64 // 生成的监听通知数
+	LeaseHits      int64 // 租约命中次数
+	LeaseFallbacks int64 // 租约回退（降级）次数
+	TTLExpiredOps  int64 // TTL过期而删除的键数
 }
 
 // 核心业务逻辑 - Do Op (执行状态机操作)
@@ -125,7 +126,7 @@ func (kv *KVServer) doGet(args *kvraftapi.GetArgs) kvraftapi.GetReply {
 
 	// 存储查询（BadgerDB 的 BlockCache 会处理热数据缓存）
 	now := time.Now().UnixNano()
-	value, version, expires, exists, err := kv.store.GetWithMeta(args.Key)
+	value, version, expires, exists, err := kv.store.Get(args.Key)
 	if err != nil {
 		log.Printf("[KVServer-%d] Get error: %v", kv.me, err)
 		kv.stats.RecordFailure()
@@ -182,7 +183,7 @@ func (kv *KVServer) doDelete(args *kvraftapi.DeleteArgs) kvraftapi.DeleteReply {
 	}
 
 	now := time.Now().UnixNano()
-	oldValue, _, expires, exists, err := kv.store.GetWithMeta(args.Key)
+	oldValue, _, expires, exists, err := kv.store.Get(args.Key)
 	if err != nil {
 		log.Printf("[KVServer-%d] Get error during Delete: %v", kv.me, err)
 		kv.stats.RecordFailure()
@@ -261,8 +262,9 @@ func (kv *KVServer) doExpire(args *kvraftapi.ExpireArgs) kvraftapi.ExpireReply {
 	}
 
 	expired := make([]string, 0, len(args.Keys))
+	expiredOldValues := make(map[string]string, len(args.Keys))
 	for _, key := range args.Keys {
-		_, _, expires, exists, err := kv.store.GetWithMeta(key)
+		oldValue, _, expires, exists, err := kv.store.Get(key)
 		if err != nil {
 			continue
 		}
@@ -273,11 +275,12 @@ func (kv *KVServer) doExpire(args *kvraftapi.ExpireArgs) kvraftapi.ExpireReply {
 			continue
 		}
 		expired = append(expired, key)
+		expiredOldValues[key] = oldValue
 	}
 	if len(expired) > 0 {
 		kv.stats.RecordTTLExpired(int64(len(expired)))
 	}
-	return kvraftapi.ExpireReply{ExpiredKeys: expired, Err: kvraftapi.OK}
+	return kvraftapi.ExpireReply{ExpiredKeys: expired, ExpiredOldValues: expiredOldValues, Err: kvraftapi.OK}
 }
 
 // 快照管理
@@ -306,66 +309,6 @@ func (kv *KVServer) Restore(data []byte) {
 	if err := kv.store.LoadSnapshot(data); err != nil {
 		log.Printf("[KVServer-%d] Restore snapshot error: %v", kv.me, err)
 	}
-}
-
-// RPC Handlers - 兼容旧 RPC 接口
-
-func (kv *KVServer) Get(args *kvraftapi.GetArgs, reply *kvraftapi.GetReply) error {
-	if kv.killed() {
-		reply.Err = kvraftapi.ErrWrongLeader
-		return nil
-	}
-	err, ret, leaseHit := kv.rsm.SubmitLeaseReadWithMode(args)
-	if err != kvraftapi.OK {
-		reply.Err = err
-		kv.stats.RecordLeaseFallback()
-		return nil
-	}
-	getReply := ret.(kvraftapi.GetReply)
-	reply.Value = getReply.Value
-	reply.Version = getReply.Version
-	reply.Expires = getReply.Expires
-	reply.Err = getReply.Err
-	kv.stats.RecordRead()
-	if kv.leaseStatEnabled {
-		if leaseHit {
-			kv.stats.RecordLeaseHit()
-		} else {
-			kv.stats.RecordLeaseFallback()
-		}
-	}
-	return nil
-}
-
-func (kv *KVServer) Put(args *kvraftapi.PutArgs, reply *kvraftapi.PutReply) error {
-	if kv.killed() {
-		reply.Err = kvraftapi.ErrWrongLeader
-		return nil
-	}
-	err, ret := kv.rsm.Submit(args)
-	if err != kvraftapi.OK {
-		reply.Err = err
-		return nil
-	}
-	putReply := ret.(kvraftapi.PutReply)
-	reply.Err = putReply.Err
-	kv.stats.RecordWrite()
-	return nil
-}
-
-func (kv *KVServer) Delete(args *kvraftapi.DeleteArgs, reply *kvraftapi.DeleteReply) error {
-	if kv.killed() {
-		reply.Err = kvraftapi.ErrWrongLeader
-		return nil
-	}
-	err, ret := kv.rsm.Submit(args)
-	if err != kvraftapi.OK {
-		reply.Err = err
-		return nil
-	}
-	deleteReply := ret.(kvraftapi.DeleteReply)
-	reply.Err = deleteReply.Err
-	return nil
 }
 
 // Watch 集成 - 关键的事件推送链路
@@ -453,7 +396,11 @@ func (kv *KVServer) notifyExpireEvent(_ *kvraftapi.ExpireArgs, result any, watch
 		return
 	}
 	for _, key := range expReply.ExpiredKeys {
-		err := watchMgr.Notify(key, "", "", 0, "EXPIRE")
+		oldValue := ""
+		if expReply.ExpiredOldValues != nil {
+			oldValue = expReply.ExpiredOldValues[key]
+		}
+		err := watchMgr.Notify(key, oldValue, "", 0, "EXPIRE")
 		if err == nil {
 			kv.stats.RecordWatchNotify()
 		}
@@ -572,9 +519,7 @@ func StartKVServer(servers []string, gid int, me int, persister Persister, maxra
 	kv.rsm = MakeRSM(servers, me, persister, maxraftstate, kv)
 	kv.rsm.RegisterOpCompleteListener(kv)
 
-	rpc.Register(kv)
 	rpcs := rpc.NewServer()
-	rpcs.Register(kv)
 	// 注册 Raft RPC 服务，供节点间选举与日志复制调用。
 	if err := rpcs.RegisterName("Raft", kv.rsm.Raft()); err != nil {
 		log.Fatal(err)

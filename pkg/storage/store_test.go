@@ -16,7 +16,7 @@ func TestLoadSnapshotAtomicSwitch(t *testing.T) {
 	}
 	defer store.Close()
 
-	if err := store.Put("k1", "v1", 1); err != nil {
+	if err := store.Put("k1", "v1", 1, 0); err != nil {
 		t.Fatalf("seed put failed: %v", err)
 	}
 
@@ -33,13 +33,13 @@ func TestLoadSnapshotAtomicSwitch(t *testing.T) {
 		t.Fatalf("load snapshot failed: %v", err)
 	}
 
-	if _, _, exists, err := store.Get("k1"); err != nil {
+	if _, _, _, exists, err := store.Get("k1"); err != nil {
 		t.Fatalf("get k1 failed: %v", err)
 	} else if exists {
 		t.Fatalf("k1 should be replaced by snapshot")
 	}
 
-	v2, ver2, ok2, err := store.Get("k2")
+	v2, ver2, _, ok2, err := store.Get("k2")
 	if err != nil {
 		t.Fatalf("get k2 failed: %v", err)
 	}
@@ -58,7 +58,7 @@ func TestLoadSnapshotInvalidInputKeepsData(t *testing.T) {
 	}
 	defer store.Close()
 
-	if err := store.Put("origin", "value", 1); err != nil {
+	if err := store.Put("origin", "value", 1, 0); err != nil {
 		t.Fatalf("seed put failed: %v", err)
 	}
 
@@ -66,7 +66,7 @@ func TestLoadSnapshotInvalidInputKeepsData(t *testing.T) {
 		t.Fatalf("expected invalid snapshot error, got nil")
 	}
 
-	v, ver, ok, err := store.Get("origin")
+	v, ver, _, ok, err := store.Get("origin")
 	if err != nil {
 		t.Fatalf("get origin failed: %v", err)
 	}

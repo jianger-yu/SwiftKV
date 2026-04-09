@@ -1,6 +1,9 @@
 package rsm
 
 import (
+	"os"
+	"path/filepath"
+	"runtime"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -10,18 +13,27 @@ import (
 	"kvraft/pkg/watch"
 )
 
+func rsmTestStorePath(t *testing.T, name string) string {
+	t.Helper()
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatalf("resolve test source path failed")
+	}
+	base := filepath.Join(filepath.Dir(thisFile), "..", "..", "data", "rsm-tests")
+	if err := os.MkdirAll(base, 0o755); err != nil {
+		t.Fatalf("create test data dir failed: %v", err)
+	}
+	path := filepath.Join(base, name+"-"+time.Now().Format("20060102-150405.000000000"))
+	return path
+}
+
 // TestBasicPutGet - 真实的 Put/Get 测试
 // 直接调用 DoOp，验证数据正确保存和读取
 func TestBasicPutGet(t *testing.T) {
 	// 创建最小化的 KVServer 实例，仅用于状态机测试
-	store, err := storage.NewStore("test-db-putget")
+	store, err := storage.NewStore(rsmTestStorePath(t, "test-db-putget"))
 	if err != nil {
 		t.Fatalf("❌ 创建 store 失败: %v", err)
-	}
-
-	// 清空之前的测试数据（防止多次运行时的冲突）
-	if err := store.Clear(); err != nil {
-		t.Logf("⚠️ 清空 store 失败: %v (这在第一次运行时是正常的)", err)
 	}
 
 	kv := &KVServer{
@@ -164,17 +176,13 @@ func TestRSMCompilation(t *testing.T) {
 
 // TestWatchMechanism - 验证 Watch 订阅、事件触发与异步接收链路
 func TestWatchMechanism(t *testing.T) {
-	store, err := storage.NewStore("test-db-watch")
+	store, err := storage.NewStore(rsmTestStorePath(t, "test-db-watch"))
 	if err != nil {
 		t.Fatalf("❌ 创建 store 失败: %v", err)
 	}
 	defer func() {
 		_ = store.Close()
 	}()
-
-	if err := store.Clear(); err != nil {
-		t.Logf("⚠️ 清空 store 失败: %v (这在第一次运行时是正常的)", err)
-	}
 
 	watchMgr := watch.NewManager(watch.DefaultConfig())
 	defer watchMgr.Close()
@@ -245,17 +253,13 @@ func TestWatchMechanism(t *testing.T) {
 }
 
 func TestWatchDeleteEvent(t *testing.T) {
-	store, err := storage.NewStore("test-db-watch-delete")
+	store, err := storage.NewStore(rsmTestStorePath(t, "test-db-watch-delete"))
 	if err != nil {
 		t.Fatalf("❌ 创建 store 失败: %v", err)
 	}
 	defer func() {
 		_ = store.Close()
 	}()
-
-	if err := store.Clear(); err != nil {
-		t.Logf("⚠️ 清空 store 失败: %v (这在第一次运行时是正常的)", err)
-	}
 
 	watchMgr := watch.NewManager(watch.DefaultConfig())
 	defer watchMgr.Close()
@@ -310,18 +314,13 @@ func TestWatchDeleteEvent(t *testing.T) {
 }
 
 func TestTTLVisibleAndExpireDelete(t *testing.T) {
-	store, err := storage.NewStore("test-db-ttl")
+	store, err := storage.NewStore(rsmTestStorePath(t, "test-db-ttl"))
 	if err != nil {
 		t.Fatalf("create store failed: %v", err)
 	}
 	defer func() {
-		_ = store.Clear()
 		_ = store.Close()
 	}()
-
-	if err := store.Clear(); err != nil {
-		t.Fatalf("clear store failed: %v", err)
-	}
 
 	kv := &KVServer{
 		me:    0,
@@ -359,11 +358,73 @@ func TestTTLVisibleAndExpireDelete(t *testing.T) {
 		t.Fatalf("expire apply failed: %v", exp.Err)
 	}
 
-	_, _, _, exists, err := kv.store.GetWithMeta("ttl-key")
+	_, _, _, exists, err := kv.store.Get("ttl-key")
 	if err != nil {
-		t.Fatalf("GetWithMeta failed: %v", err)
+		t.Fatalf("Get failed: %v", err)
 	}
 	if exists {
 		t.Fatalf("expired key was not deleted")
+	}
+}
+
+func TestWatchExpireEventOldValue(t *testing.T) {
+	store, err := storage.NewStore(rsmTestStorePath(t, "test-db-watch-expire"))
+	if err != nil {
+		t.Fatalf("❌ 创建 store 失败: %v", err)
+	}
+	defer func() {
+		_ = store.Close()
+	}()
+
+	watchMgr := watch.NewManager(watch.DefaultConfig())
+	defer watchMgr.Close()
+
+	kv := &KVServer{
+		me:    0,
+		dead:  0,
+		store: store,
+		stats: &ServerStats{},
+		rsm:   &RSM{watchMgr: watchMgr},
+	}
+
+	const key = "expire_watch_key"
+	if putRes := kv.DoOp(&kvraftapi.PutArgs{Key: key, Value: "will-expire", Version: 0, TTL: 1}); putRes.(kvraftapi.PutReply).Err != kvraftapi.OK {
+		t.Fatalf("❌ 预置数据失败")
+	}
+
+	watcher, err := watchMgr.Subscribe(key, false)
+	if err != nil {
+		t.Fatalf("❌ Subscribe 失败: %v", err)
+	}
+	defer func() {
+		_ = watchMgr.Unsubscribe(watcher.ID)
+	}()
+
+	time.Sleep(1200 * time.Millisecond)
+	now := time.Now().UnixNano()
+	keys, err := kv.store.GetExpiredKeys(now, 16)
+	if err != nil {
+		t.Fatalf("GetExpiredKeys failed: %v", err)
+	}
+	expArgs := &kvraftapi.ExpireArgs{Keys: keys, Cutoff: now}
+	expReply := kv.DoOp(expArgs).(kvraftapi.ExpireReply)
+	if expReply.Err != kvraftapi.OK {
+		t.Fatalf("expire apply failed: %v", expReply.Err)
+	}
+	kv.OnOpComplete(expArgs, expReply, 3)
+
+	select {
+	case ev := <-watcher.Channel:
+		if ev.EventType != "EXPIRE" {
+			t.Fatalf("❌ 事件类型错误，期望 EXPIRE，收到 %q", ev.EventType)
+		}
+		if ev.OldValue != "will-expire" {
+			t.Fatalf("❌ 旧值错误，期望 will-expire，收到 %q", ev.OldValue)
+		}
+		if ev.NewValue != "" {
+			t.Fatalf("❌ 新值错误，期望空，收到 %q", ev.NewValue)
+		}
+	case <-time.After(800 * time.Millisecond):
+		t.Fatalf("❌ 等待 EXPIRE Watch 事件超时")
 	}
 }

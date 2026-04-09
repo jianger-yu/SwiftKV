@@ -271,7 +271,7 @@ func main() {
 					break
 				}
 
-				if explicitVersion || (errCode != kvraftapi.ErrVersion && errCode != kvraftapi.ErrMaybe) || attempts >= maxAttempts || time.Now().After(deadline) {
+				if explicitVersion || (errCode != kvraftapi.ErrVersion && errCode != kvraftapi.ErrMaybe && errCode != kvraftapi.ErrNoKey) || attempts >= maxAttempts || time.Now().After(deadline) {
 					fmt.Printf("put err=%s\n", errCode)
 					break
 				}
@@ -347,7 +347,7 @@ func main() {
 					break
 				}
 
-				if explicitVersion || (errCode != kvraftapi.ErrVersion && errCode != kvraftapi.ErrMaybe) || attempts >= maxAttempts || time.Now().After(deadline) {
+				if explicitVersion || (errCode != kvraftapi.ErrVersion && errCode != kvraftapi.ErrMaybe && errCode != kvraftapi.ErrNoKey) || attempts >= maxAttempts || time.Now().After(deadline) {
 					fmt.Printf("put-ttl err=%s\n", errCode)
 					break
 				}
@@ -369,7 +369,11 @@ func main() {
 				fmt.Println("usage: del <key>")
 				continue
 			}
-			errCode := ck.Delete(parts[1])
+			key := parts[1]
+			errCode := ck.Delete(key)
+			if errCode == kvraftapi.OK || errCode == kvraftapi.ErrNoKey {
+				delete(localVersion, key)
+			}
 			fmt.Printf("delete err=%s\n", errCode)
 		case "scan":
 			if len(parts) < 2 || len(parts) > 3 {

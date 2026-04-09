@@ -67,6 +67,7 @@ type ExpireArgs struct {
 }
 
 type ExpireReply struct {
-	ExpiredKeys []string
-	Err         Err
+	ExpiredKeys      []string
+	ExpiredOldValues map[string]string
+	Err              Err
 }
