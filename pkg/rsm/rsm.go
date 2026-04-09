@@ -16,7 +16,7 @@ import (
 	"kvraft/pkg/watch"
 )
 
-var useRaftStateMachine bool // to plug in another raft besided raft1
+var useRaftStateMachine bool // 用于选择另一个 Raft 实现（未使用）
 
 type Persister interface {
 	ReadRaftState() []byte
@@ -26,9 +26,6 @@ type Persister interface {
 }
 
 type Op struct {
-	// Your definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
 	Me  int   // 发起请求的服务器 id
 	Id  int64 // 每次为一个请求生成一个唯一的 id
 	Req any   // 请求内容
@@ -48,12 +45,9 @@ type OpCompleteListener interface {
 	OnOpComplete(req any, result any, index int64)
 }
 
-// A server (i.e., ../server.go) that wants to replicate itself calls
-// MakeRSM and must implement the StateMachine interface.  This
-// interface allows the rsm package to interact with the server for
-// server-specific operations: the server must implement DoOp to
-// execute an operation (e.g., a Get or Put request), and
-// Snapshot/Restore to snapshot and restore the server's state.
+// StateMachine 是状态机接口。需要复制自身的服务器应调用 MakeRSM 并实现本接口。
+// 该接口允许 rsm 包与应用层交互。应用层必须实现 DoOp 以执行操作（如 Get/Put 请求），
+// 并通过 Snapshot/Restore 实现快照功能以持久化和恢复服态。
 type StateMachine interface {
 	DoOp(any) any
 	Snapshot() []byte
@@ -71,17 +65,16 @@ type RSM struct {
 	me           int
 	rf           kvraftapi.Raft
 	applyCh      chan kvraftapi.ApplyMsg
-	maxraftstate int // snapshot if log grows this big
+	maxraftstate int // 当 Raft 日志大小超过此值时触发快照
 	sm           StateMachine
 	persister    raft.Persister
-	// Your definitions here.
-	idCounter  int64
-	waitingOps map[int]*waitingOp // 正在等待的操作，key 是日志索引
-	shutdown   atomic.Bool
-	watchMgr   *watch.Manager     // Watch 管理器
-	opListener OpCompleteListener // 操作完成监听器（用于 Watch 回调）
-	walLogger  *wal.Logger
-	leaseRead  atomic.Bool
+	idCounter    int64
+	waitingOps   map[int]*waitingOp // 正在等待的操作，key 是日志索引
+	shutdown     atomic.Bool
+	watchMgr     *watch.Manager     // Watch 管理器
+	opListener   OpCompleteListener // 操作完成监听器（用于 Watch 回调）
+	walLogger    *wal.Logger
+	leaseRead    atomic.Bool
 }
 
 // Close 优雅关闭 RSM 相关后台组件。
@@ -113,27 +106,14 @@ func (rsm *RSM) Close() {
 	rsm.waitingOps = make(map[int]*waitingOp)
 }
 
-// servers[] contains the ports of the set of
-// servers that will cooperate via Raft to
-// form the fault-tolerant key/value service.
-//
-// me is the index of the current server in servers[].
-//
-// the k/v server should store snapshots through the underlying Raft
-// implementation, which should call persister.SaveStateAndSnapshot() to
-// atomically save the Raft state along with the snapshot.
-// The RSM should snapshot when Raft's saved state exceeds maxraftstate bytes,
-// in order to allow Raft to garbage-collect its log. if maxraftstate is -1,
-// you don't need to snapshot.
-//
-// MakeRSM() must return quickly, so it should start goroutines for
-// any long-running work.
+// MakeRSM 创建复制状态机实例。
+// MakeRSM 应快速返回，由后台 goroutine 进行长期运行的工作。
 func MakeRSM(
-	peers []string,
-	me int,
-	persister Persister,
-	maxraftstate int,
-	sm StateMachine,
+	peers []string, // Raft 集群中各节点的网络地址
+	me int, // 当前节点在 peers 中的下标
+	persister Persister, // 用于持久化 Raft 状态和快照的存储器
+	maxraftstate int, // 当 Raft 日志大小达到此值时触发快照（-1 表示不启用快照）
+	sm StateMachine, // 应用层实现的状态机
 ) *RSM {
 	rsm := &RSM{
 		me:           me,
@@ -264,16 +244,9 @@ func (rsm *RSM) RegisterOpCompleteListener(listener OpCompleteListener) {
 	rsm.opListener = listener
 }
 
-// Submit a command to Raft, and wait for it to be committed.  It
-// should return ErrWrongLeader if client should find new leader and
-// try again.
+// Submit 向 Raft 提交一条命令并等待其被提交。
+// 如果当前节点不是 Leader，返回 ErrWrongLeader，客户端应重新查找 Leader 后重试。
 func (rsm *RSM) Submit(req any) (kvraftapi.Err, any) {
-
-	// Submit creates an Op structure to run a command through Raft;
-	// for example: op := Op{Me: rsm.me, Id: id, Req: req}, where req
-	// is the argument to Submit and id is a unique id for the op.
-
-	// your code here
 	if rsm.shutdown.Load() {
 		return kvraftapi.ErrWrongLeader, nil
 	}

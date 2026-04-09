@@ -62,7 +62,7 @@ func NewStore(dbPath string) (*Store, error) {
 	}, nil
 }
 
-// Get returns value/version/raw expiry timestamp for a key.
+// Get 返回一个键的值、版本号和绝对过期时间戳。
 func (s *Store) Get(key string) (value string, version uint64, expires int64, exists bool, err error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -182,7 +182,7 @@ func (s *Store) PutCASWithTTL(key, value string, expectedVersion uint64, expires
 	return oldValue, status, err
 }
 
-// GetExpiredKeys returns keys whose expiry is <= cutoff.
+// GetExpiredKeys 返回所有过期时间 <= cutoff 阀值的键。
 func (s *Store) GetExpiredKeys(cutoff int64, limit int) ([]string, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-// Entry records a state-machine operation that has been committed by Raft.
+// Entry 记录了已被 Raft 提交的状态机操作。
 type Entry struct {
 	RaftIndex int64  `json:"raft_index"`
 	Term      int    `json:"term"`
@@ -83,7 +83,7 @@ func (l *Logger) Append(entry Entry) error {
 	return nil
 }
 
-// TruncateUpTo keeps entries with raft_index > upToIndex.
+// TruncateUpTo 保留 raft_index > upToIndex 的条目。
 func (l *Logger) TruncateUpTo(upToIndex int64) error {
 	if l == nil || !l.enabled {
 		return nil
