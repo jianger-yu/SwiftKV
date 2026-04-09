@@ -238,7 +238,7 @@ func RunRealBenchmark(ctx context.Context, cfg BenchmarkConfig) (BenchmarkResult
 				probe = 16
 			}
 			for i := 0; i < probe; i++ {
-				_, _, e := seedCheckClerk.Get(fmt.Sprintf("key-%d", i))
+				_, _, _, e := seedCheckClerk.Get(fmt.Sprintf("key-%d", i))
 				if e != kvraftapi.OK {
 					allSeeded = false
 					break
@@ -387,11 +387,11 @@ func RunRealBenchmark(ctx context.Context, cfg BenchmarkConfig) (BenchmarkResult
 				var errCode kvraftapi.Err
 
 				if r.Float64() < cfg.ReadRatio {
-					_, _, errCode = workerClerk.Get(key)
+					_, _, _, errCode = workerClerk.Get(key)
 					localRead++
 				} else {
 					value := fmt.Sprintf("value-%d-%d", id, i)
-					_, version, getErr := workerClerk.Get(key)
+					_, version, _, getErr := workerClerk.Get(key)
 					if getErr == kvraftapi.OK {
 						errCode = workerClerk.Put(key, value, version)
 					} else if getErr == kvraftapi.ErrNoKey {

@@ -326,11 +326,11 @@ func runBenchmarkInternal(scenario TestScenario, servers []string) *BenchmarkInt
 
 				var errCode kvraftapi.Err
 				if r.Float64() < scenario.ReadRatio {
-					_, _, errCode = c.Get(key)
+					_, _, _, errCode = c.Get(key)
 					readOps++
 				} else {
 					value := fmt.Sprintf("value-%d-%d", id, i)
-					_, version, getErr := c.Get(key)
+					_, version, _, getErr := c.Get(key)
 					if getErr == kvraftapi.OK {
 						errCode = c.Put(key, value, version)
 					} else {

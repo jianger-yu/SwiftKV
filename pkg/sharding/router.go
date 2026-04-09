@@ -272,8 +272,13 @@ func (r *ShardRouter) GetFromGroup(ctx context.Context, gid int, key string) (*p
 	return nil, lastErr
 }
 
-// PutToGroup 在指定分组内执行 Put。
+// PutToGroup 在指定分组内执行 Put（不带 TTL）。
 func (r *ShardRouter) PutToGroup(ctx context.Context, gid int, key string, value string, version int64) (*pb.PutResponse, error) {
+	return r.PutToGroupWithTTL(ctx, gid, key, value, version, 0)
+}
+
+// PutToGroupWithTTL 在指定分组内执行 Put（带 TTL，单位秒；<=0 表示不过期）。
+func (r *ShardRouter) PutToGroupWithTTL(ctx context.Context, gid int, key string, value string, version int64, ttlSeconds int64) (*pb.PutResponse, error) {
 	var lastErr error
 	for _, replica := range r.groupReplicaCandidates(gid) {
 		r.mu.RLock()
@@ -284,7 +289,7 @@ func (r *ShardRouter) PutToGroup(ctx context.Context, gid int, key string, value
 		}
 
 		reqCtx, cancel := r.withRequestTimeout(ctx)
-		resp, rpcErr := client.Put(reqCtx, &pb.PutRequest{Key: key, Value: value, Version: version})
+		resp, rpcErr := client.Put(reqCtx, &pb.PutRequest{Key: key, Value: value, Version: version, TtlSeconds: ttlSeconds})
 		cancel()
 
 		if rpcErr != nil {
@@ -395,13 +400,18 @@ func (r *ShardRouter) GetRoute(ctx context.Context, key string) (*pb.GetResponse
 	return r.GetFromGroup(ctx, gid, key)
 }
 
-// PutRoute 路由 Put 请求。
+// PutRoute 路由 Put 请求（不带 TTL）。
 func (r *ShardRouter) PutRoute(ctx context.Context, key string, value string, version int64) (*pb.PutResponse, error) {
+	return r.PutRouteWithTTL(ctx, key, value, version, 0)
+}
+
+// PutRouteWithTTL 路由 Put 请求（带 TTL，单位秒；<=0 表示不过期）。
+func (r *ShardRouter) PutRouteWithTTL(ctx context.Context, key string, value string, version int64, ttlSeconds int64) (*pb.PutResponse, error) {
 	gid, err := r.groupForKey(key)
 	if err != nil {
 		return nil, err
 	}
-	return r.PutToGroup(ctx, gid, key, value, version)
+	return r.PutToGroupWithTTL(ctx, gid, key, value, version, ttlSeconds)
 }
 
 // DeleteRoute 路由 Delete 请求。

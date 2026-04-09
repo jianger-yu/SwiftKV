@@ -308,3 +308,62 @@ func TestWatchDeleteEvent(t *testing.T) {
 		t.Fatalf("❌ 等待 DELETE Watch 事件超时")
 	}
 }
+
+func TestTTLVisibleAndExpireDelete(t *testing.T) {
+	store, err := storage.NewStore("test-db-ttl")
+	if err != nil {
+		t.Fatalf("create store failed: %v", err)
+	}
+	defer func() {
+		_ = store.Clear()
+		_ = store.Close()
+	}()
+
+	if err := store.Clear(); err != nil {
+		t.Fatalf("clear store failed: %v", err)
+	}
+
+	kv := &KVServer{
+		me:    0,
+		dead:  0,
+		store: store,
+		stats: &ServerStats{},
+	}
+
+	put := kv.DoOp(&kvraftapi.PutArgs{Key: "ttl-key", Value: "v", Version: 0, TTL: 2}).(kvraftapi.PutReply)
+	if put.Err != kvraftapi.OK {
+		t.Fatalf("put with ttl failed: %v", put.Err)
+	}
+
+	getBefore := kv.DoOp(&kvraftapi.GetArgs{Key: "ttl-key"}).(kvraftapi.GetReply)
+	if getBefore.Err != kvraftapi.OK {
+		t.Fatalf("get before expire failed: %v", getBefore.Err)
+	}
+	if getBefore.Expires <= time.Now().UnixNano() {
+		t.Fatalf("expires not visible as absolute timestamp, got=%d", getBefore.Expires)
+	}
+
+	time.Sleep(2300 * time.Millisecond)
+
+	getAfter := kv.DoOp(&kvraftapi.GetArgs{Key: "ttl-key"}).(kvraftapi.GetReply)
+	if getAfter.Err != kvraftapi.ErrNoKey {
+		t.Fatalf("expected ErrNoKey after ttl expiry, got=%v", getAfter.Err)
+	}
+
+	keys, err := kv.store.GetExpiredKeys(time.Now().UnixNano(), 16)
+	if err != nil {
+		t.Fatalf("GetExpiredKeys failed: %v", err)
+	}
+	exp := kv.DoOp(&kvraftapi.ExpireArgs{Keys: keys, Cutoff: time.Now().UnixNano()}).(kvraftapi.ExpireReply)
+	if exp.Err != kvraftapi.OK {
+		t.Fatalf("expire apply failed: %v", exp.Err)
+	}
+
+	_, _, _, exists, err := kv.store.GetWithMeta("ttl-key")
+	if err != nil {
+		t.Fatalf("GetWithMeta failed: %v", err)
+	}
+	if exists {
+		t.Fatalf("expired key was not deleted")
+	}
+}

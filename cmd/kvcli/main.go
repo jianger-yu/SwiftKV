@@ -94,6 +94,7 @@ func printHelp() {
 	fmt.Println("  help")
 	fmt.Println("  get <key>")
 	fmt.Println("  put <key> <value> [version]")
+	fmt.Println("  put-ttl <key> <value> <ttl_seconds> [version]")
 	fmt.Println("  del <key>")
 	fmt.Println("  scan <prefix> [limit]")
 	fmt.Println("  watch key <key>")
@@ -101,6 +102,11 @@ func printHelp() {
 	fmt.Println("  unwatch <id|all>")
 	fmt.Println("  list-watch")
 	fmt.Println("  exit")
+	fmt.Println("")
+	fmt.Println("notes:")
+	fmt.Println("  - get displays 'expires' field in nanoseconds (0 means no expiry)")
+	fmt.Println("  - put-ttl stores value with TTL in seconds")
+	fmt.Println("  - scan results include expires for each key")
 }
 
 func parseLimit(raw string) (int32, error) {
@@ -199,8 +205,19 @@ func main() {
 				fmt.Println("usage: get <key>")
 				continue
 			}
-			val, ver, e := ck.Get(parts[1])
-			fmt.Printf("value=%q version=%d err=%s\n", val, ver, e)
+			val, ver, expires, e := ck.Get(parts[1])
+			if e == kvraftapi.OK {
+				remainingSec := (expires - time.Now().UnixNano()) / int64(time.Second)
+				if expires > 0 && remainingSec > 0 {
+					fmt.Printf("value=%q version=%d expires=%d (remaining=%ds) err=%s\n", val, ver, expires, remainingSec, e)
+				} else if expires > 0 {
+					fmt.Printf("value=%q version=%d expires=%d (expired) err=%s\n", val, ver, expires, e)
+				} else {
+					fmt.Printf("value=%q version=%d expires=0 (no-expiry) err=%s\n", val, ver, e)
+				}
+			} else {
+				fmt.Printf("value=%q version=%d err=%s\n", val, ver, e)
+			}
 		case "put":
 			if len(parts) < 3 || len(parts) > 4 {
 				fmt.Println("usage: put <key> <value> [version]")
@@ -222,7 +239,7 @@ func main() {
 				if v, ok := localVersion[key]; ok {
 					version = v
 				} else {
-					_, ver, gerr := ck.Get(key)
+					_, ver, _, gerr := ck.Get(key)
 					if gerr == kvraftapi.OK {
 						version = ver
 					} else if gerr == kvraftapi.ErrNoKey {
@@ -259,13 +276,89 @@ func main() {
 					break
 				}
 
-				_, ver, gerr := ck.Get(key)
+				_, ver, _, gerr := ck.Get(key)
 				if gerr == kvraftapi.OK {
 					version = ver
 				} else if gerr == kvraftapi.ErrNoKey {
 					version = 0
 				} else {
 					fmt.Printf("put err=%s (refresh failed: %v)\n", errCode, gerr)
+					break
+				}
+
+				time.Sleep(2 * time.Millisecond)
+			}
+		case "put-ttl":
+			if len(parts) < 4 || len(parts) > 5 {
+				fmt.Println("usage: put-ttl <key> <value> <ttl_seconds> [version]")
+				continue
+			}
+			key := parts[1]
+			value := parts[2]
+			ttlSeconds, parseTTLErr := strconv.ParseInt(parts[3], 10, 64)
+			if parseTTLErr != nil {
+				fmt.Printf("invalid ttl_seconds: %v\n", parseTTLErr)
+				continue
+			}
+
+			var version kvraftapi.Tversion
+			explicitVersion := false
+			if len(parts) == 5 {
+				v, parseErr := strconv.ParseInt(parts[4], 10, 64)
+				if parseErr != nil {
+					fmt.Printf("invalid version: %v\n", parseErr)
+					continue
+				}
+				version = kvraftapi.Tversion(v)
+				explicitVersion = true
+			} else {
+				if v, ok := localVersion[key]; ok {
+					version = v
+				} else {
+					_, ver, _, gerr := ck.Get(key)
+					if gerr == kvraftapi.OK {
+						version = ver
+					} else if gerr == kvraftapi.ErrNoKey {
+						version = 0
+					} else {
+						fmt.Printf("cannot determine version automatically: %v\n", gerr)
+						continue
+					}
+				}
+			}
+
+			attempts := 0
+			maxAttempts := 1
+			deadline := time.Now().Add(1200 * time.Millisecond)
+			if !explicitVersion {
+				maxAttempts = 200
+			}
+
+			for {
+				attempts++
+				errCode := ck.PutWithTTL(key, value, version, ttlSeconds)
+				if errCode == kvraftapi.OK {
+					localVersion[key] = version + 1
+					if attempts == 1 {
+						fmt.Printf("put-ttl err=%s ttl=%ds\n", errCode, ttlSeconds)
+					} else {
+						fmt.Printf("put-ttl err=%s ttl=%ds retries=%d\n", errCode, ttlSeconds, attempts-1)
+					}
+					break
+				}
+
+				if explicitVersion || (errCode != kvraftapi.ErrVersion && errCode != kvraftapi.ErrMaybe) || attempts >= maxAttempts || time.Now().After(deadline) {
+					fmt.Printf("put-ttl err=%s\n", errCode)
+					break
+				}
+
+				_, ver, _, gerr := ck.Get(key)
+				if gerr == kvraftapi.OK {
+					version = ver
+				} else if gerr == kvraftapi.ErrNoKey {
+					version = 0
+				} else {
+					fmt.Printf("put-ttl err=%s (refresh failed: %v)\n", errCode, gerr)
 					break
 				}
 
@@ -302,7 +395,17 @@ func main() {
 			})
 			fmt.Printf("scan count=%d\n", len(items))
 			for _, item := range items {
-				fmt.Printf("  %s => %q (v=%d)\n", item.GetKey(), item.GetValue(), item.GetVersion())
+				expires := item.GetExpires()
+				if expires > 0 {
+					remainingSec := (expires - time.Now().UnixNano()) / int64(time.Second)
+					if remainingSec > 0 {
+						fmt.Printf("  %s => %q (v=%d expires=%d remaining=%ds)\n", item.GetKey(), item.GetValue(), item.GetVersion(), expires, remainingSec)
+					} else {
+						fmt.Printf("  %s => %q (v=%d expires=%d expired)\n", item.GetKey(), item.GetValue(), item.GetVersion(), expires)
+					}
+				} else {
+					fmt.Printf("  %s => %q (v=%d no-expiry)\n", item.GetKey(), item.GetValue(), item.GetVersion())
+				}
 			}
 		case "watch":
 			if len(parts) != 3 {

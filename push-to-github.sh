@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
-COMMIT_MSG="optimization: modify comment"
+COMMIT_MSG="fix(ttl): resolve expiration logic and enhance client robustness"
 RUN_TEST=1
 DRY_RUN=0
 

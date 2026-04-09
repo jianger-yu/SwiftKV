@@ -13,6 +13,37 @@ import (
 	"kvraft/pkg/sharding"
 )
 
+// kvmigrate 使用方法（中文速览）:
+//
+// 1) 最常用（显式指定源/目标配置）
+//    go run ./cmd/kvmigrate \
+//      -source-config ./data/cluster/sharding.json \
+//      -target-config ./data/cluster/sharding-next.json
+//
+// 2) 只看迁移计划，不执行写入（推荐先 dry-run）
+//    go run ./cmd/kvmigrate \
+//      -source-config ./data/cluster/sharding.json \
+//      -target-config ./data/cluster/sharding-next.json \
+//      -dry-run
+//
+// 3) 仅迁移某个前缀，并限制条数
+//    go run ./cmd/kvmigrate \
+//      -source-config ./data/cluster/sharding.json \
+//      -target-config ./data/cluster/sharding-next.json \
+//      -prefix user: -limit 1000
+//
+// 4) 迁移完成后删除源数据（谨慎使用）
+//    go run ./cmd/kvmigrate \
+//      -source-config ./data/cluster/sharding.json \
+//      -target-config ./data/cluster/sharding-next.json \
+//      -delete-source
+//
+// 5) 自动读取运行时配置（无需参数）
+//    直接执行: go run ./cmd/kvmigrate
+//    将优先读取 data/cluster/runtime.env 里的:
+//      SHARDING_CONFIG      (source-config)
+//      SHARDING_NEXT_CONFIG (target-config)
+
 type jsonGroup struct {
 	GroupID   int      `json:"group_id"`
 	Replicas  []string `json:"replicas"`

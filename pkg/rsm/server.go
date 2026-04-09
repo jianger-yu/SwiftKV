@@ -45,19 +45,19 @@ type OperationInfo struct {
 }
 
 type KVServer struct {
-	me               int
-	dead             int32
-	address          string
-	rsm              *RSM
-	mu               sync.RWMutex
-	store            *storage.Store
-	stats            *ServerStats
-	leaseStatEnabled bool
-	ttlEvery         time.Duration
-	ttlBatch         int
-	rpcLn            net.Listener
-	grpcLn           net.Listener
-	grpcSrv          *grpc.Server
+	me               int            // 当前节点在集群中的索引 ID
+	dead             int32          // 用于关闭服务
+	address          string         // 本节点的原始 RPC 地址
+	rsm              *RSM           // 复制状态机指针
+	mu               sync.RWMutex   // 读写锁
+	store            *storage.Store // 存储引擎指针
+	stats            *ServerStats   // 统计器指针
+	leaseStatEnabled bool           // 控制是否开启昂贵的租约统计逻辑
+	ttlEvery         time.Duration  // 定义后台清理过期键的频率
+	ttlBatch         int            //定义每次清理任务最多删除多少个键，防止长时间占用 CPU
+	rpcLn            net.Listener   // 网络监听器,用于节点间 Raft 通信
+	grpcLn           net.Listener   // 网络监听器,用于外部客户端 gRPC 接入
+	grpcSrv          *grpc.Server   // gRPC 服务实例
 }
 
 func leaseStatsEnabledFromEnv() bool {
@@ -133,14 +133,10 @@ func (kv *KVServer) doGet(args *kvraftapi.GetArgs) kvraftapi.GetReply {
 	}
 
 	if exists && !isExpired(expires, now) {
-		remaining := int64(0)
-		if expires > 0 {
-			remaining = expires - now
-		}
 		return kvraftapi.GetReply{
 			Value:   value,
 			Version: kvraftapi.Tversion(version),
-			Expires: remaining,
+			Expires: expires,
 			Err:     kvraftapi.OK,
 		}
 	}

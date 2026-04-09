@@ -246,27 +246,27 @@ func mapPBErr(errText string) kvraftapi.Err {
 	}
 }
 
-// Get 获取一个键的当前值和版本。如果键不存在，返回 ErrNoKey。
+// Get 获取一个键的当前值、版本和过期时间（UnixNano 绝对时间）。如果键不存在，返回 ErrNoKey。
 // 在面对所有其他错误时，它会不断重试。
 //
 // args 和 reply 的类型（包括它们是否为指针）必须与 RPC 处理函数的
 // 参数的声明类型相匹配。此外，reply 必须作为指针传递。
-func (ck *Clerk) Get(key string) (string, kvraftapi.Tversion, kvraftapi.Err) {
+func (ck *Clerk) Get(key string) (string, kvraftapi.Tversion, int64, kvraftapi.Err) {
 	if ck.router != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		resp, err := ck.router.GetRoute(ctx, key)
 		if err != nil || resp == nil {
-			return "", 0, kvraftapi.ErrWrongLeader
+			return "", 0, 0, kvraftapi.ErrWrongLeader
 		}
 		errCode := mapPBErr(resp.GetError())
 		if errCode == kvraftapi.OK {
-			return resp.GetValue(), kvraftapi.Tversion(resp.GetVersion()), kvraftapi.OK
+			return resp.GetValue(), kvraftapi.Tversion(resp.GetVersion()), resp.GetExpires(), kvraftapi.OK
 		}
 		if errCode == kvraftapi.ErrNoKey {
-			return "", 0, kvraftapi.ErrNoKey
+			return "", 0, 0, kvraftapi.ErrNoKey
 		}
-		return "", 0, errCode
+		return "", 0, 0, errCode
 	}
 
 	// 不是分片模式或分片路由未启用，进入传统模式
@@ -279,7 +279,7 @@ func (ck *Clerk) Get(key string) (string, kvraftapi.Tversion, kvraftapi.Err) {
 		case <-timeout:
 			fmt.Println("\n⚠️  获取操作超时（10秒）")
 			fmt.Println("提示: 请确保 KVraft 服务器已启动:")
-			return "", 0, kvraftapi.ErrWrongLeader
+			return "", 0, 0, kvraftapi.ErrWrongLeader
 		default:
 		}
 
@@ -300,10 +300,10 @@ func (ck *Clerk) Get(key string) (string, kvraftapi.Tversion, kvraftapi.Err) {
 				errCode := mapPBErr(resp.GetError())
 				if errCode == kvraftapi.OK {
 					ck.leader = index
-					return resp.GetValue(), kvraftapi.Tversion(resp.GetVersion()), kvraftapi.OK
+					return resp.GetValue(), kvraftapi.Tversion(resp.GetVersion()), resp.GetExpires(), kvraftapi.OK
 				}
 				if errCode == kvraftapi.ErrNoKey {
-					return "", 0, kvraftapi.ErrNoKey
+					return "", 0, 0, kvraftapi.ErrNoKey
 				}
 				if errCode == kvraftapi.ErrWrongLeader {
 					if leader := parseRedirectLeaderAddr(resp.GetError()); leader != "" {
@@ -326,7 +326,7 @@ func (ck *Clerk) Get(key string) (string, kvraftapi.Tversion, kvraftapi.Err) {
 			if attempts > 100 {
 				fmt.Printf("\n⚠️  Get 已尝试 %d 次，仍无可用服务器\n", attempts)
 				fmt.Println("提示: 请确保 KVraft 服务器已启动:")
-				return "", 0, kvraftapi.ErrWrongLeader
+				return "", 0, 0, kvraftapi.ErrWrongLeader
 			}
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -381,6 +381,86 @@ func (ck *Clerk) Put(key string, value string, version kvraftapi.Tversion) kvraf
 
 			ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout(250))
 			resp, rpcErr := client.Put(ctx, &pb.PutRequest{Key: args.Key, Value: args.Value, Version: int64(args.Version)})
+			cancel()
+			if rpcErr == nil && resp != nil {
+				errCode := mapPBErr(resp.GetError())
+				switch errCode {
+				case kvraftapi.OK, kvraftapi.ErrNoKey:
+					ck.leader = index
+					return errCode
+				case kvraftapi.ErrVersion:
+					ck.leader = index
+					if !retry {
+						return kvraftapi.ErrVersion
+					}
+					return kvraftapi.ErrMaybe
+				case kvraftapi.ErrWrongLeader:
+					if leader := parseRedirectLeaderAddr(resp.GetError()); leader != "" {
+						leader = toGRPCAddress(leader)
+						if idx, ok := ck.serverToIdx[leader]; ok {
+							ck.leader = idx
+						}
+					}
+				}
+			} else if rpcErr != nil {
+				if leader := parseRedirectLeaderAddr(rpcErr.Error()); leader != "" {
+					leader = toGRPCAddress(leader)
+					if idx, ok := ck.serverToIdx[leader]; ok {
+						ck.leader = idx
+					}
+				}
+			}
+
+			attempts++
+			if attempts > 100 {
+				fmt.Printf("\n⚠️  Put 已尝试 %d 次，仍无可用服务器\n", attempts)
+				fmt.Println("提示: 请确保 KVraft 服务器已启动:")
+				return kvraftapi.ErrWrongLeader
+			}
+		}
+
+		retry = true
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// PutWithTTL 修改一个键值对，带有TTL支持
+func (ck *Clerk) PutWithTTL(key string, value string, version kvraftapi.Tversion, ttlSeconds int64) kvraftapi.Err {
+	if ck.router != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		resp, err := ck.router.PutRouteWithTTL(ctx, key, value, int64(version), ttlSeconds)
+		if err != nil || resp == nil {
+			return kvraftapi.ErrWrongLeader
+		}
+		return mapPBErr(resp.GetError())
+	}
+
+	args := kvraftapi.PutArgs{Key: key, Value: value, Version: version, TTL: ttlSeconds}
+	retry := false
+	timeout := time.After(10 * time.Second)
+	attempts := 0
+
+	for {
+		select {
+		case <-timeout:
+			fmt.Println("\n⚠️  写入操作超时（10秒）")
+			fmt.Println("提示: 请确保 KVraft 服务器已启动:")
+			return kvraftapi.ErrWrongLeader
+		default:
+		}
+
+		candidates := ck.preferredCandidates(key)
+		for _, index := range candidates {
+			addr := ck.grpcServers[index]
+			client, err := ck.getClient(addr)
+			if err != nil {
+				attempts++
+				continue
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout(250))
+			resp, rpcErr := client.Put(ctx, &pb.PutRequest{Key: args.Key, Value: args.Value, Version: int64(args.Version), TtlSeconds: args.TTL})
 			cancel()
 			if rpcErr == nil && resp != nil {
 				errCode := mapPBErr(resp.GetError())
