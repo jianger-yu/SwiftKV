@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -51,6 +52,7 @@ type BenchmarkResult struct {
 	MinLatency      time.Duration
 	MaxLatency      time.Duration
 	AvgLatency      time.Duration
+	P99Latency      time.Duration
 }
 
 func cleanBenchmarkDataDirs(servers []string) {
@@ -334,6 +336,7 @@ func RunRealBenchmark(ctx context.Context, cfg BenchmarkConfig) (BenchmarkResult
 	var wg sync.WaitGroup
 	var totalLatency time.Duration
 	var latencySamples int64
+	latencyValues := make([]int64, 0, cfg.Clients*cfg.Requests)
 	workerClerks := make([]*rsm.Clerk, cfg.Clients)
 	for i := 0; i < cfg.Clients; i++ {
 		c, err := makeBenchmarkClerk(servers, cfg.Sharded, shardingCfg)
@@ -373,6 +376,7 @@ func RunRealBenchmark(ctx context.Context, cfg BenchmarkConfig) (BenchmarkResult
 			var localSamples int64
 			localMinLatency := time.Duration(1<<63 - 1)
 			localMaxLatency := time.Duration(0)
+			localLatencyValues := make([]int64, 0, cfg.Requests)
 
 		loop:
 			for i := 0; i < cfg.Requests; i++ {
@@ -416,6 +420,7 @@ func RunRealBenchmark(ctx context.Context, cfg BenchmarkConfig) (BenchmarkResult
 				if latency > localMaxLatency {
 					localMaxLatency = latency
 				}
+				localLatencyValues = append(localLatencyValues, latency.Nanoseconds())
 
 				if errCode == kvraftapi.OK || errCode == kvraftapi.ErrNoKey || errCode == kvraftapi.ErrVersion {
 					localSuccess++
@@ -439,6 +444,7 @@ func RunRealBenchmark(ctx context.Context, cfg BenchmarkConfig) (BenchmarkResult
 			if localMaxLatency > res.MaxLatency {
 				res.MaxLatency = localMaxLatency
 			}
+			latencyValues = append(latencyValues, localLatencyValues...)
 			mu.Unlock()
 		}(clientIdx)
 	}
@@ -454,9 +460,21 @@ func RunRealBenchmark(ctx context.Context, cfg BenchmarkConfig) (BenchmarkResult
 	// 6. 计算平均延迟
 	if latencySamples > 0 {
 		res.AvgLatency = totalLatency / time.Duration(latencySamples)
+		sort.Slice(latencyValues, func(i, j int) bool {
+			return latencyValues[i] < latencyValues[j]
+		})
+		idx := int(float64(len(latencyValues))*0.99) - 1
+		if idx < 0 {
+			idx = 0
+		}
+		if idx >= len(latencyValues) {
+			idx = len(latencyValues) - 1
+		}
+		res.P99Latency = time.Duration(latencyValues[idx])
 	} else {
 		res.MinLatency = 0
 		res.MaxLatency = 0
+		res.P99Latency = 0
 	}
 
 	// 7. 清理资源
@@ -589,6 +607,7 @@ func main() {
 	fmt.Printf("  最小: %.2f ms\n", res.MinLatency.Seconds()*1000)
 	fmt.Printf("  最大: %.2f ms\n", res.MaxLatency.Seconds()*1000)
 	fmt.Printf("  平均: %.2f ms\n", res.AvgLatency.Seconds()*1000)
+	fmt.Printf("  P99: %.2f ms\n", res.P99Latency.Seconds()*1000)
 	fmt.Println()
 	fmt.Printf("总耗时: %v\n", time.Since(startTime))
 	fmt.Println("========================================")

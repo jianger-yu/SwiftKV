@@ -30,6 +30,9 @@ RESTART_CLUSTER=false
 CLEAN=false
 FRESH_RUN=false
 SHARDED_MODE="auto"
+REGRESSION=false
+REGRESSION_ROUNDS=3
+ELECTION_SAMPLE_MS=1000
 
 ARCH=""
 SHARD_GROUPS=""
@@ -143,6 +146,18 @@ while [[ $# -gt 0 ]]; do
       SHARDED_MODE="$2"
       shift 2
       ;;
+    --regression)
+      REGRESSION="$2"
+      shift 2
+      ;;
+    --regression-rounds)
+      REGRESSION_ROUNDS="$2"
+      shift 2
+      ;;
+    --election-sample-ms)
+      ELECTION_SAMPLE_MS="$2"
+      shift 2
+      ;;
     *)
       echo "未知参数: $1"
       exit 1
@@ -231,6 +246,12 @@ else
   RPC_SERVERS="$(build_addr_csv "${SERVERS}" "${R_BASE_PORT}")"
 fi
 
+if [[ -n "${R_GRPC_SERVERS}" ]]; then
+  STATUS_SERVERS="${R_GRPC_SERVERS}"
+else
+  STATUS_SERVERS="$(build_addr_csv "${SERVERS}" "$((R_BASE_PORT + 1000))")"
+fi
+
 if [[ "${SHARDED_MODE}" == "auto" ]]; then
   if [[ "${R_ARCH}" == "group-ring" ]]; then
     SHARDED="true"
@@ -266,6 +287,118 @@ bench_cmd=(
 
 if [[ "${SHARDED}" == "true" && -n "${R_SHARDING_CONFIG}" && -f "${R_SHARDING_CONFIG}" ]]; then
   bench_cmd+=(--sharding-config="${R_SHARDING_CONFIG}")
+fi
+
+extract_metric() {
+  local key="$1"
+  local file="$2"
+  case "${key}" in
+    throughput)
+      grep -E '^吞吐:' "${file}" | tail -n1 | awk '{print $2}'
+      ;;
+    p99)
+      grep -E 'P99:' "${file}" | tail -n1 | awk '{print $2}'
+      ;;
+    avg)
+      grep -E '平均:' "${file}" | tail -n1 | awk '{print $2}'
+      ;;
+  esac
+}
+
+sample_election_loop() {
+  local stop_file="$1"
+  local stats_file="$2"
+  local prev_sig=""
+  local changes=0
+  local term_jumps=0
+  local prev_term=-1
+  local samples=0
+
+  while [[ ! -f "${stop_file}" ]]; do
+    local status_out
+    status_out="$(./scripts/check_status.sh --servers "${STATUS_SERVERS}" 2>/dev/null || true)"
+
+    local sig
+    sig="$(awk '
+      $0 ~ /Leader/ {
+        term=""
+        for (i=1; i<=NF; i++) {
+          if (($i=="true" || $i=="false") && i>1 && $(i-1) ~ /^[0-9]+$/) {
+            term=$(i-1)
+          }
+        }
+        print $1 ":" $2 ":" term
+      }
+    ' <<<"${status_out}" | sort | tr '\n' ';')"
+
+    local max_term
+    max_term="$(awk '
+      {
+        for (i=1; i<=NF; i++) {
+          if (($i=="true" || $i=="false") && i>1 && $(i-1) ~ /^[0-9]+$/) {
+            if ($(i-1)+0 > m) m=$(i-1)+0
+          }
+        }
+      }
+      END { if (m=="") m=0; print m }
+    ' <<<"${status_out}")"
+
+    if [[ -n "${sig}" ]]; then
+      if [[ -n "${prev_sig}" && "${sig}" != "${prev_sig}" ]]; then
+        changes=$((changes + 1))
+      fi
+      prev_sig="${sig}"
+    fi
+    if [[ "${prev_term}" -ge 0 && "${max_term}" -gt "${prev_term}" ]]; then
+      term_jumps=$((term_jumps + 1))
+    fi
+    prev_term="${max_term}"
+    samples=$((samples + 1))
+    sleep "$(awk "BEGIN {printf \"%.3f\", ${ELECTION_SAMPLE_MS}/1000}")"
+  done
+
+  echo "${changes},${term_jumps},${samples}" > "${stats_file}"
+}
+
+run_regression_suite() {
+  local csv_file="${PERF_DIR}/perf_regression_${stamp}.csv"
+  echo "round,throughput_ops,p99_ms,avg_ms,leader_changes,term_jumps,samples,report" > "${csv_file}"
+
+  local round
+  for ((round=1; round<=REGRESSION_ROUNDS; round++)); do
+    local round_report="${PERF_DIR}/perf_${stamp}_round${round}.log"
+    local stop_file="${PERF_DIR}/.election_stop_${stamp}_${round}"
+    local election_file="${PERF_DIR}/election_${stamp}_round${round}.log"
+    rm -f "${stop_file}" "${election_file}"
+
+    sample_election_loop "${stop_file}" "${election_file}" &
+    local sampler_pid=$!
+
+    "${bench_cmd[@]}" | tee "${round_report}" >/dev/null
+
+    touch "${stop_file}"
+    wait "${sampler_pid}" || true
+
+    local throughput p99 avg election_stats leader_changes term_jumps samples
+    throughput="$(extract_metric throughput "${round_report}")"
+    p99="$(extract_metric p99 "${round_report}")"
+    avg="$(extract_metric avg "${round_report}")"
+    election_stats="$(cat "${election_file}" 2>/dev/null || echo "0,0,0")"
+    leader_changes="$(cut -d',' -f1 <<<"${election_stats}")"
+    term_jumps="$(cut -d',' -f2 <<<"${election_stats}")"
+    samples="$(cut -d',' -f3 <<<"${election_stats}")"
+
+    echo "${round},${throughput:-0},${p99:-0},${avg:-0},${leader_changes:-0},${term_jumps:-0},${samples:-0},${round_report}" >> "${csv_file}"
+    echo "回归轮次 ${round}/${REGRESSION_ROUNDS}: throughput=${throughput:-0} ops/s, p99=${p99:-0} ms, leader_changes=${leader_changes:-0}, term_jumps=${term_jumps:-0}"
+  done
+
+  echo "回归测试完成，汇总: ${csv_file}"
+}
+
+if [[ "${REGRESSION}" == "true" ]]; then
+  echo "开始执行回归模式..."
+  run_regression_suite
+  exit 0
 fi
 
 "${bench_cmd[@]}" | tee "${report_file}"

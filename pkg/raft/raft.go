@@ -21,6 +21,12 @@ import (
 	//	tester "6.5840/tester1"
 )
 
+var persistBufferPool = sync.Pool{
+	New: func() interface{} {
+		return new(bytes.Buffer)
+	},
+}
+
 type Persister interface {
 	ReadRaftState() []byte
 	ReadSnapshot() []byte
@@ -37,6 +43,14 @@ const (
 type LogEntry struct {
 	Term    int
 	Command interface{}
+}
+
+type persistentState struct {
+	CurrentTerm       int
+	VotedFor          int
+	Log               []LogEntry
+	LastIncludedIndex int
+	LastIncludedTerm  int
 }
 
 // 实现单个 Raft 节点的 Go 对象。
@@ -172,24 +186,7 @@ func (rf *Raft) getTerm(index int) int {
 // 将 Raft 的持久状态保存到稳定存储中，
 // 以便在崩溃并重启后能够恢复。
 func (rf *Raft) persist() {
-	// 你的代码在这里 (3C)。
-	// 示例：
-	// w := new(bytes.Buffer)
-	// e := gob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
-	w := new(bytes.Buffer)
-	e := gob.NewEncoder(w)
-
-	e.Encode(rf.CurrentTerm)
-	e.Encode(rf.VotedFor)
-	e.Encode(rf.log)
-	e.Encode(rf.lastIncludedIndex)
-	e.Encode(rf.lastIncludedTerm)
-
-	data := w.Bytes()
+	data := encodePersistentState(rf.capturePersistentState())
 	// Regular persist does not need to rewrite snapshot each time.
 	rf.persister.Save(data, nil)
 }
@@ -233,17 +230,40 @@ func (rf *Raft) PersistBytes() int {
 }
 
 func (rf *Raft) persistWithSnapshot(snapshot []byte) {
-	w := new(bytes.Buffer)
-	e := gob.NewEncoder(w)
-
-	e.Encode(rf.CurrentTerm)
-	e.Encode(rf.VotedFor)
-	e.Encode(rf.log)
-	e.Encode(rf.lastIncludedIndex)
-	e.Encode(rf.lastIncludedTerm)
-
-	state := w.Bytes()
+	state := encodePersistentState(rf.capturePersistentState())
 	rf.persister.Save(state, snapshot)
+}
+
+func (rf *Raft) capturePersistentState() persistentState {
+	logs := make([]LogEntry, len(rf.log))
+	copy(logs, rf.log)
+	return persistentState{
+		CurrentTerm:       rf.CurrentTerm,
+		VotedFor:          rf.VotedFor,
+		Log:               logs,
+		LastIncludedIndex: rf.lastIncludedIndex,
+		LastIncludedTerm:  rf.lastIncludedTerm,
+	}
+}
+
+func encodePersistentState(s persistentState) []byte {
+	buf := persistBufferPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	enc := gob.NewEncoder(buf)
+
+	_ = enc.Encode(s.CurrentTerm)
+	_ = enc.Encode(s.VotedFor)
+	_ = enc.Encode(s.Log)
+	_ = enc.Encode(s.LastIncludedIndex)
+	_ = enc.Encode(s.LastIncludedTerm)
+
+	data := append([]byte(nil), buf.Bytes()...)
+	if buf.Cap() <= 1<<20 {
+		persistBufferPool.Put(buf)
+	} else {
+		persistBufferPool.Put(new(bytes.Buffer))
+	}
+	return data
 }
 
 // 服务端通知 Raft：它已创建了一个包含

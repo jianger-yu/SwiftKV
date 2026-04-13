@@ -428,3 +428,44 @@ func TestWatchExpireEventOldValue(t *testing.T) {
 		t.Fatalf("❌ 等待 EXPIRE Watch 事件超时")
 	}
 }
+
+func TestPersisterFaultInjectionManifestFallback(t *testing.T) {
+	dataDir := rsmTestStorePath(t, "test-db-persister-fi")
+
+	fp, err := NewFilePersister(dataDir)
+	if err != nil {
+		t.Fatalf("create persister failed: %v", err)
+	}
+
+	stateV1 := []byte("raft-state-v1")
+	snapV1 := []byte("snapshot-v1")
+	fp.Save(stateV1, snapV1)
+	if err := fp.Close(); err != nil {
+		t.Fatalf("close persister failed: %v", err)
+	}
+
+	partialRaft := filepath.Join(dataDir, "raft-state.00000000000000000002.bin")
+	if err := os.WriteFile(partialRaft, []byte("raft-state-v2-partial"), 0o644); err != nil {
+		t.Fatalf("inject partial raft file failed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, manifestFileName), []byte("{broken-manifest"), 0o644); err != nil {
+		t.Fatalf("inject broken manifest failed: %v", err)
+	}
+
+	fp2, err := NewFilePersister(dataDir)
+	if err != nil {
+		t.Fatalf("reopen persister with fault injection failed: %v", err)
+	}
+	defer func() {
+		_ = fp2.Close()
+	}()
+
+	gotState := fp2.ReadRaftState()
+	gotSnap := fp2.ReadSnapshot()
+	if string(gotState) != string(stateV1) {
+		t.Fatalf("fallback raft state mismatch: got=%q want=%q", string(gotState), string(stateV1))
+	}
+	if string(gotSnap) != string(snapV1) {
+		t.Fatalf("fallback snapshot mismatch: got=%q want=%q", string(gotSnap), string(snapV1))
+	}
+}

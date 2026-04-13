@@ -4,7 +4,16 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
-COMMIT_MSG="feat: complete Dockerization and fix startup issues"
+COMMIT_MSG="refactor: 优化持久化链路，提升数据可靠性与并发性能
+
+针对存储链路进行深度重构，主要改进如下：
+- [P0] 引入代际 Manifest 机制，确保 raft-state 与 snapshot 的原子一致性。
+- [P0] 升级 atomicWrite 为 durable-write，补全 fsync 语义以应对掉电场景。
+- [P1] 将 gob 序列化移出 Raft 主锁路径，大幅降低心跳延迟与选举抖动。
+- [P1] 实现 Save 操作的异步批处理（Group Commit），提升 IO 吞吐量。
+- [P2] 引入 sync.Pool 复用编码缓冲区，减少高频持久化带来的 GC 压力。
+
+此改动通过了 smoke_test 基础验证，显著提升了高负载下的系统稳定性。"
 RUN_TEST=1
 DRY_RUN=0
 

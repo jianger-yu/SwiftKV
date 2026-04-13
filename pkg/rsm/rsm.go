@@ -61,20 +61,25 @@ type waitingOp struct {
 }
 
 type RSM struct {
-	mu           sync.Mutex
-	me           int
-	rf           kvraftapi.Raft
-	applyCh      chan kvraftapi.ApplyMsg
-	maxraftstate int // 当 Raft 日志大小超过此值时触发快照
-	sm           StateMachine
-	persister    raft.Persister
-	idCounter    int64
-	waitingOps   map[int]*waitingOp // 正在等待的操作，key 是日志索引
-	shutdown     atomic.Bool
-	watchMgr     *watch.Manager     // Watch 管理器
-	opListener   OpCompleteListener // 操作完成监听器（用于 Watch 回调）
-	walLogger    *wal.Logger
-	leaseRead    atomic.Bool
+	mu            sync.Mutex
+	me            int
+	rf            kvraftapi.Raft
+	applyCh       chan kvraftapi.ApplyMsg
+	maxraftstate  int // 当 Raft 日志大小超过此值时触发快照
+	sm            StateMachine
+	persister     raft.Persister
+	idCounter     int64
+	waitingOps    map[int]*waitingOp // 正在等待的操作，key 是日志索引
+	shutdown      atomic.Bool
+	watchMgr      *watch.Manager     // Watch 管理器
+	opListener    OpCompleteListener // 操作完成监听器（用于 Watch 回调）
+	walLogger     *wal.Logger
+	leaseRead     atomic.Bool
+	snapshotInFly atomic.Bool
+	lastSnapIndex int
+	lastSnapAt    time.Time
+	snapMinDelta  int
+	snapMinGap    time.Duration
 }
 
 // Close 优雅关闭 RSM 相关后台组件。
@@ -124,6 +129,8 @@ func MakeRSM(
 		idCounter:    0,
 		waitingOps:   make(map[int]*waitingOp),
 		watchMgr:     watch.NewManager(watch.DefaultConfig()),
+		snapMinDelta: 256,
+		snapMinGap:   500 * time.Millisecond,
 	}
 	rsm.shutdown.Store(false)
 	rsm.leaseRead.Store(true)
@@ -136,6 +143,7 @@ func MakeRSM(
 		rsm.walLogger = walLogger
 	}
 	rsm.rf = raft.Make(peers, me, persister, rsm.applyCh)
+	rsm.lastSnapAt = time.Now()
 	if maxraftstate != -1 {
 		snapshot := persister.ReadSnapshot()
 		if len(snapshot) > 0 {
@@ -149,6 +157,7 @@ func MakeRSM(
 			}
 			atomic.StoreInt64(&rsm.idCounter, idctr)
 			rsm.sm.Restore(smSnapshot)
+			rsm.lastSnapAt = time.Now()
 		}
 	}
 	go rsm.applyLoop()
@@ -383,9 +392,29 @@ func (rsm *RSM) applyCommand(msg kvraftapi.ApplyMsg) {
 	}
 	rsm.mu.Unlock()
 
-	if rsm.maxraftstate != -1 && rsm.rf.PersistBytes() > (rsm.maxraftstate*19)/20 {
-		go rsm.createSnapshot(msg.CommandIndex)
+	if rsm.shouldCreateSnapshot(msg.CommandIndex) {
+		if rsm.snapshotInFly.CompareAndSwap(false, true) {
+			go rsm.createSnapshot(msg.CommandIndex)
+		}
 	}
+}
+
+func (rsm *RSM) shouldCreateSnapshot(commandIndex int) bool {
+	if rsm.maxraftstate == -1 {
+		return false
+	}
+	if rsm.rf.PersistBytes() <= (rsm.maxraftstate*19)/20 {
+		return false
+	}
+	rsm.mu.Lock()
+	defer rsm.mu.Unlock()
+	if commandIndex-rsm.lastSnapIndex < rsm.snapMinDelta {
+		return false
+	}
+	if time.Since(rsm.lastSnapAt) < rsm.snapMinGap {
+		return false
+	}
+	return true
 }
 
 func (rsm *RSM) applySnapshot(msg kvraftapi.ApplyMsg) {
@@ -407,6 +436,7 @@ func (rsm *RSM) applySnapshot(msg kvraftapi.ApplyMsg) {
 }
 
 func (rsm *RSM) createSnapshot(lastIncludedIndex int) {
+	defer rsm.snapshotInFly.Store(false)
 	if rsm.shutdown.Load() {
 		return
 	}
@@ -417,6 +447,10 @@ func (rsm *RSM) createSnapshot(lastIncludedIndex int) {
 	e.Encode(idctr)
 	e.Encode(smSnapshot)
 	rsm.rf.Snapshot(lastIncludedIndex, w.Bytes())
+	rsm.mu.Lock()
+	rsm.lastSnapIndex = lastIncludedIndex
+	rsm.lastSnapAt = time.Now()
+	rsm.mu.Unlock()
 	if rsm.walLogger != nil {
 		if err := rsm.walLogger.TruncateUpTo(int64(lastIncludedIndex)); err != nil {
 			log.Printf("[RSM-%d] WAL truncate failed at snapshot index=%d: %v", rsm.me, lastIncludedIndex, err)
