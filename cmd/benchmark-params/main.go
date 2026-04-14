@@ -217,7 +217,7 @@ func runBenchmark(params BenchmarkParams, scenario TestScenario) (*BenchResult, 
 			return nil, fmt.Errorf("创建 persister %d 失败: %w", i, err)
 		}
 		persisters[i] = p
-		kvServers[i] = rsm.StartKVServer(servers, 1, i, persisters[i], -1, servers[i])
+		kvServers[i] = rsm.StartKVServer(servers, 1, i, persisters[i], 1048576, servers[i])
 	}
 	time.Sleep(500 * time.Millisecond)
 	fmt.Println(" OK")

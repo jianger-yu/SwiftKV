@@ -35,7 +35,7 @@ type BenchmarkConfig struct {
 	InitKeys         int           // 预热 key 数量，0 表示跳过预热
 	SkipInitIfSeeded bool          // 外部集群下，若 key 已存在则跳过预热
 	Duration         time.Duration // 压测阶段最长时长
-	MaxRaftState     int           // 快照阈值，-1 表示关闭
+	MaxRaftState     int           // 快照阈值，默认开启（1MB）
 	Sharded          bool          // 是否使用 MakeShardedClerk
 }
 
@@ -174,7 +174,7 @@ func RunRealBenchmark(ctx context.Context, cfg BenchmarkConfig) (BenchmarkResult
 		cfg.Duration = 30 * time.Second
 	}
 	if cfg.MaxRaftState == 0 {
-		cfg.MaxRaftState = -1
+		cfg.MaxRaftState = 1048576
 	}
 
 	// 1. 构建服务器地址列表
@@ -525,7 +525,7 @@ func main() {
 	initKeys := flag.Int("init-keys", 10000, "预热 key 数量，0 表示跳过预热")
 	skipInitIfSeeded := flag.Bool("skip-init-if-seeded", true, "外部集群下若已存在预热 key 则跳过预热")
 	duration := flag.Duration("duration", 30*time.Second, "压测最长时长")
-	maxRaftState := flag.Int("maxraftstate", -1, "快照阈值字节数，-1 表示关闭快照")
+	maxRaftState := flag.Int("maxraftstate", 1048576, "快照阈值字节数，默认 1048576（1MB），-1 表示关闭快照")
 	sharded := flag.Bool("sharded", false, "是否使用 MakeShardedClerk 路由模式（单 Raft 组建议 false，多 group 分片建议 true）")
 	flag.Parse()
 

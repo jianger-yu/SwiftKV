@@ -123,7 +123,7 @@ func main() {
 	rpcAddr := servers[nodeID]
 	httpAddr := getenvStr("REST_LISTEN", "0.0.0.0:8001")
 	metricsAddr := getenvStr("METRICS_LISTEN", "0.0.0.0:9100")
-	maxRaftState := getenvInt("MAX_RAFT_STATE", -1)
+	maxRaftState := getenvInt("MAX_RAFT_STATE", 1048576)
 
 	dataDir := filepath.Join(runtimeDataRoot(), fmt.Sprintf("node-%d", nodeID))
 	persister, err := rsm.NewFilePersister(dataDir)

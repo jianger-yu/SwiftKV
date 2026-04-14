@@ -161,24 +161,18 @@ func (rf *Raft) IsLeaderWithLease() bool {
 }
 
 func (rf *Raft) getLastLogIndex() int {
-	// return len(rf.log) - 1
 	return rf.lastIncludedIndex + len(rf.log) - 1
 }
 
 func (rf *Raft) getLastLogTerm() int {
-	// return rf.log[len(rf.log)-1].Term
 	if len(rf.log) == 0 {
 		return rf.lastIncludedTerm
 	}
-	return rf.log[len(rf.log)-1].Term
-}
-
-func (rf *Raft) lastIndex() int {
-	return rf.lastIncludedIndex + len(rf.log) - 1
+	return rf.getTerm(rf.getLastLogIndex())
 }
 
 func (rf *Raft) getTerm(index int) int {
-	if index == rf.lastIncludedIndex {
+	if index <= rf.lastIncludedIndex {
 		return rf.lastIncludedTerm
 	}
 	return rf.log[index-rf.lastIncludedIndex].Term
@@ -433,10 +427,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.resetElectionTimer()
 
 	// ---（第 4 步）prevLogIndex 不存在：日志冲突---
-	if args.PrevLogIndex > rf.lastIndex() {
+	if args.PrevLogIndex > rf.getLastLogIndex() {
 		reply.Success = false
 		reply.ConflictTerm = -1
-		reply.ConflictIndex = rf.lastIndex() + 1
+		reply.ConflictIndex = rf.getLastLogIndex() + 1
 		return nil
 	}
 
@@ -469,7 +463,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	for ; i < len(args.Entries); i++ {
 		index := args.PrevLogIndex + 1 + i
 
-		if index > rf.lastIndex() {
+		if index > rf.getLastLogIndex() {
 			break
 		}
 
@@ -495,7 +489,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// // ---（第 8 步）更新 CommitIndex ---
 	if args.LeaderCommit > rf.CommitIndex {
 		// rf.CommitIndex = min(args.LeaderCommit, len(rf.log)-1)
-		rf.CommitIndex = min(args.LeaderCommit, rf.lastIndex())
+		rf.CommitIndex = min(args.LeaderCommit, rf.getLastLogIndex())
 		// 可选：应用日志到状态机 ApplyMsg
 		// rf.applyLogEntries()
 	}
@@ -603,7 +597,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	}
 
 	// 关键修复：正确处理日志截断
-	if args.LastIncludedIndex <= rf.lastIndex() &&
+	if args.LastIncludedIndex <= rf.getLastLogIndex() &&
 		rf.getTerm(args.LastIncludedIndex) == args.LastIncludedTerm {
 		// 快照覆盖的日志与本地一致，保留后续日志
 		newLog := make([]LogEntry, 0)

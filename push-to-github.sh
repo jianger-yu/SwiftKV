@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
-COMMIT_MSG="refactor: optimize persistence layer with batching and decoupled storage"
+COMMIT_MSG="refactor: consolidate redundant logic and merge similar helper functions"
 RUN_TEST=1
 DRY_RUN=0
 
