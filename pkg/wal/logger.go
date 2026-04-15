@@ -72,6 +72,7 @@ func NewLogger(path string, enabled bool) (*Logger, error) {
 	return l, nil
 }
 
+// 判断是否启用 WAL
 func (l *Logger) Enabled() bool {
 	return l != nil && l.enabled
 }
@@ -130,6 +131,7 @@ func (l *Logger) Replay(handler func(Entry) error) error {
 	return nil
 }
 
+// 序列化 Entry，入队，等待 worker 落盘完成
 func (l *Logger) Append(entry Entry) error {
 	if l == nil || !l.enabled {
 		return nil
@@ -223,6 +225,7 @@ func (l *Logger) TruncateUpTo(upToIndex int64) error {
 	return nil
 }
 
+// 按 upToIndex 重写 wal.tmp 再 rename
 func rewriteWALAfterTruncate(path string, upToIndex int64) error {
 	input, err := os.Open(path)
 	if err != nil {
@@ -285,6 +288,7 @@ func rewriteWALAfterTruncate(path string, upToIndex int64) error {
 	return nil
 }
 
+// 维护后 reopen 文件并重启 worker
 func (l *Logger) restartWorkerAfterMaintenance(updateState func()) error {
 	f, err := os.OpenFile(l.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
@@ -335,6 +339,7 @@ func (l *Logger) Close() error {
 	return nil
 }
 
+// 创建通道并启动 runWorker
 func (l *Logger) startWorkerLocked() error {
 	if !l.enabled {
 		return nil
@@ -354,6 +359,7 @@ func (l *Logger) startWorkerLocked() error {
 	return nil
 }
 
+// 关闭 stopCh，等待 worker 退出，清空通道状态
 func (l *Logger) stopWorkerLocked() error {
 	if !l.workerAlive {
 		return nil
@@ -374,6 +380,7 @@ func (l *Logger) stopWorkerLocked() error {
 	return nil
 }
 
+// 批量聚合请求并调用 writeAndSync，回填 Done
 func (l *Logger) runWorker(file *os.File, reqCh <-chan WALRequest, stopCh <-chan struct{}, workerDone chan struct{}) {
 	defer close(workerDone)
 
@@ -435,6 +442,7 @@ func (l *Logger) runWorker(file *os.File, reqCh <-chan WALRequest, stopCh <-chan
 	}
 }
 
+// 单批 payload 写入并 file.Sync
 func writeAndSync(file *os.File, payload []byte) error {
 	if len(payload) == 0 {
 		return nil
@@ -456,6 +464,7 @@ func writeAndSync(file *os.File, payload []byte) error {
 	return nil
 }
 
+// 设置 fatalErr 并关闭文件，进入不可用状态
 func (l *Logger) setFatalErr(err error) {
 	l.mu.Lock()
 	if l.fatalErr == nil {

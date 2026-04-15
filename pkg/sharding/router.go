@@ -216,6 +216,11 @@ func (r *ShardRouter) groupReplicaCandidates(gid int) []string {
 	}
 
 	maxCandidates := r.config.PreferredReplicas
+	// 单 group 部署下必须尝试所有可用副本；
+	// 否则 leader 不在前 N 个副本时会出现持续 ErrWrongLeader。
+	if len(r.config.Groups) == 1 {
+		maxCandidates = len(candidates)
+	}
 	if maxCandidates <= 0 || maxCandidates > len(candidates) {
 		maxCandidates = len(candidates)
 	}

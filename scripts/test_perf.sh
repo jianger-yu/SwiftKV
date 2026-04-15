@@ -253,7 +253,7 @@ else
 fi
 
 if [[ "${SHARDED_MODE}" == "auto" ]]; then
-  if [[ "${R_ARCH}" == "group-ring" ]]; then
+  if [[ "${R_ARCH}" == "group-ring" && "${R_GROUPS:-1}" -gt 1 ]]; then
     SHARDED="true"
   else
     SHARDED="false"

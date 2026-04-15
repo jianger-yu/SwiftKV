@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
-COMMIT_MSG="refactor: consolidate redundant logic and merge similar helper functions"
+COMMIT_MSG="feat: batch HardState persistence into save worker"
 RUN_TEST=1
 DRY_RUN=0
 

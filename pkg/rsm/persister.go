@@ -29,6 +29,11 @@ type saveRequest struct {
 	done      chan error
 }
 
+type hardStateRequest struct {
+	hardstate []byte
+	done      chan error
+}
+
 // FilePersister 基于文件系统的持久化器实现
 // 原子性写入：先写临时文件，再重命名，确保崩溃时不损坏
 type FilePersister struct {
@@ -43,6 +48,7 @@ type FilePersister struct {
 	manifest   persisterManifest
 	batchSize  int
 	reqCh      chan saveRequest
+	hardReqCh  chan hardStateRequest
 	stopCh     chan struct{}
 	workerDone chan struct{}
 	closed     bool
@@ -74,6 +80,7 @@ func NewFilePersister(dataDir string) (*FilePersister, error) {
 	}
 
 	fp.reqCh = make(chan saveRequest, 1024)
+	fp.hardReqCh = make(chan hardStateRequest, 1024)
 	fp.stopCh = make(chan struct{})
 	fp.workerDone = make(chan struct{})
 	go fp.runSaveWorker()
@@ -145,15 +152,28 @@ func (fp *FilePersister) Save(raftstate []byte, snapshot []byte) {
 // SaveHardState 持久化 Raft 硬状态（CurrentTerm/VotedFor）
 func (fp *FilePersister) SaveHardState(hardstate []byte) {
 	fp.mu.RLock()
-	if fp.closed {
+	if fp.closed || fp.hardReqCh == nil || fp.stopCh == nil {
 		fp.mu.RUnlock()
 		fmt.Fprintf(os.Stderr, "[FilePersister] save hard-state ignored: persister closed\n")
 		return
 	}
-	path := fp.hardStateFile
+	hardReqCh := fp.hardReqCh
+	stopCh := fp.stopCh
 	fp.mu.RUnlock()
 
-	if err := fp.durableWrite(path, append([]byte(nil), hardstate...)); err != nil {
+	req := hardStateRequest{
+		hardstate: append([]byte(nil), hardstate...),
+		done:      make(chan error, 1),
+	}
+
+	select {
+	case hardReqCh <- req:
+	case <-stopCh:
+		fmt.Fprintf(os.Stderr, "[FilePersister] save hard-state dropped: persister stopping\n")
+		return
+	}
+
+	if err := <-req.done; err != nil {
 		fmt.Fprintf(os.Stderr, "[FilePersister] failed to save hard-state: %v\n", err)
 	}
 }
@@ -165,8 +185,19 @@ func (fp *FilePersister) runSaveWorker() {
 	defer ticker.Stop()
 
 	batch := make([]saveRequest, 0, fp.batchSize)
+	hardBatch := make([]hardStateRequest, 0, fp.batchSize)
 
 	flush := func() {
+		if len(hardBatch) > 0 {
+			latestHard := hardBatch[len(hardBatch)-1]
+			err := fp.commitHardState(latestHard.hardstate)
+			for i := range hardBatch {
+				hardBatch[i].done <- err
+				close(hardBatch[i].done)
+			}
+			hardBatch = hardBatch[:0]
+		}
+
 		if len(batch) == 0 {
 			return
 		}
@@ -186,6 +217,11 @@ func (fp *FilePersister) runSaveWorker() {
 			if len(batch) >= fp.batchSize {
 				flush()
 			}
+		case req := <-fp.hardReqCh:
+			hardBatch = append(hardBatch, req)
+			if len(hardBatch) >= fp.batchSize {
+				flush()
+			}
 		case <-ticker.C:
 			flush()
 		case <-fp.stopCh:
@@ -193,6 +229,16 @@ func (fp *FilePersister) runSaveWorker() {
 			return
 		}
 	}
+}
+
+func (fp *FilePersister) commitHardState(hardstate []byte) error {
+	fp.mu.RLock()
+	path := fp.hardStateFile
+	fp.mu.RUnlock()
+	if err := fp.durableWrite(path, hardstate); err != nil {
+		return fmt.Errorf("durable write hard state: %w", err)
+	}
+	return nil
 }
 
 func (fp *FilePersister) commitGeneration(raftstate []byte, snapshot []byte) error {
