@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -78,7 +79,9 @@ type RSM struct {
 	walLogger     *wal.Logger
 	leaseRead     atomic.Bool
 	snapshotInFly atomic.Bool
+	walGCInFly    atomic.Bool
 	lastSnapIndex int
+	lastApplied   int
 	lastSnapAt    time.Time
 	snapMinDelta  int
 	snapMinGap    time.Duration
@@ -146,21 +149,31 @@ func MakeRSM(
 	}
 	rsm.rf = raft.Make(peers, me, persister, rsm.applyCh)
 	rsm.lastSnapAt = time.Now()
-	if maxraftstate != -1 {
-		snapshot := persister.ReadSnapshot()
-		if len(snapshot) > 0 {
-			r := bytes.NewBuffer(snapshot)
-			d := gob.NewDecoder(r)
-			var idctr int64
-			var smSnapshot []byte
-			if d.Decode(&idctr) != nil ||
-				d.Decode(&smSnapshot) != nil {
-				panic("RSM unable to read snapshot")
-			}
-			atomic.StoreInt64(&rsm.idCounter, idctr)
-			rsm.sm.Restore(smSnapshot)
-			rsm.lastSnapAt = time.Now()
+	snapshot := persister.ReadSnapshot()
+	if len(snapshot) > 0 {
+		r := bytes.NewBuffer(snapshot)
+		d := gob.NewDecoder(r)
+		var idctr int64
+		var smSnapshot []byte
+		if d.Decode(&idctr) != nil ||
+			d.Decode(&smSnapshot) != nil {
+			panic("RSM unable to read snapshot")
 		}
+		atomic.StoreInt64(&rsm.idCounter, idctr)
+		rsm.sm.Restore(smSnapshot)
+		rsm.lastSnapAt = time.Now()
+	}
+
+	rsm.lastSnapIndex = rsm.rf.GetLastIncludedIndex()
+	rsm.lastApplied = rsm.lastSnapIndex
+
+	if rsm.walLogger != nil && rsm.walLogger.Enabled() {
+		recoveredIndex, err := rsm.recoverFromWAL(rsm.lastSnapIndex)
+		if err != nil {
+			panic(fmt.Sprintf("RSM WAL replay failed: %v", err))
+		}
+		rsm.rf.SyncAppliedIndex(recoveredIndex)
+		rsm.lastApplied = recoveredIndex
 	}
 	go rsm.applyLoop()
 	return rsm
@@ -221,12 +234,22 @@ func walEntryFromOp(me int, commandIndex int, term int, oper Op) wal.Entry {
 	case kvraftapi.GetArgs:
 		entry.OpType = "GET"
 		entry.Key = t.Key
+	case *kvraftapi.ScanArgs:
+		entry.OpType = "SCAN"
+	case kvraftapi.ScanArgs:
+		entry.OpType = "SCAN"
 	case *kvraftapi.PutArgs:
 		entry.OpType = "PUT"
 		entry.Key = t.Key
+		entry.Value = t.Value
+		entry.Version = int64(t.Version)
+		entry.TTL = t.TTL
 	case kvraftapi.PutArgs:
 		entry.OpType = "PUT"
 		entry.Key = t.Key
+		entry.Value = t.Value
+		entry.Version = int64(t.Version)
+		entry.TTL = t.TTL
 	case *kvraftapi.DeleteArgs:
 		entry.OpType = "DELETE"
 		entry.Key = t.Key
@@ -235,12 +258,88 @@ func walEntryFromOp(me int, commandIndex int, term int, oper Op) wal.Entry {
 		entry.Key = t.Key
 	case *kvraftapi.ExpireArgs:
 		entry.OpType = "EXPIRE"
+		entry.Keys = append([]string(nil), t.Keys...)
+		entry.Cutoff = t.Cutoff
 	case kvraftapi.ExpireArgs:
 		entry.OpType = "EXPIRE"
+		entry.Keys = append([]string(nil), t.Keys...)
+		entry.Cutoff = t.Cutoff
 	default:
 		entry.OpType = fmt.Sprintf("%T", oper.Req)
 	}
 	return entry
+}
+
+func walEntryToRequest(entry wal.Entry) (any, bool, error) {
+	opType := strings.ToUpper(strings.TrimSpace(entry.OpType))
+	switch opType {
+	case "GET":
+		return nil, false, nil
+	case "SCAN":
+		return nil, false, nil
+	case "PUT":
+		return &kvraftapi.PutArgs{
+			Key:     entry.Key,
+			Value:   entry.Value,
+			Version: kvraftapi.Tversion(entry.Version),
+			TTL:     entry.TTL,
+		}, true, nil
+	case "DELETE":
+		return &kvraftapi.DeleteArgs{Key: entry.Key}, true, nil
+	case "EXPIRE":
+		return &kvraftapi.ExpireArgs{
+			Keys:   append([]string(nil), entry.Keys...),
+			Cutoff: entry.Cutoff,
+		}, true, nil
+	default:
+		// 兼容历史 WAL 中 default fmt(%T) 记录的只读操作类型。
+		if strings.Contains(entry.OpType, "GetArgs") || strings.Contains(entry.OpType, "ScanArgs") {
+			return nil, false, nil
+		}
+		return nil, false, fmt.Errorf("unsupported WAL op type: %s", entry.OpType)
+	}
+}
+
+func (rsm *RSM) recoverFromWAL(snapshotIndex int) (int, error) {
+	recoveredIndex := snapshotIndex
+	err := rsm.walLogger.Replay(func(entry wal.Entry) error {
+		entryIndex := int(entry.RaftIndex)
+		if entryIndex <= snapshotIndex {
+			return nil
+		}
+		if entryIndex <= recoveredIndex {
+			return nil
+		}
+
+		req, mutates, err := walEntryToRequest(entry)
+		if err != nil {
+			return err
+		}
+		if mutates {
+			rsm.sm.DoOp(req)
+		}
+		recoveredIndex = entryIndex
+		return nil
+	})
+	if err != nil {
+		return snapshotIndex, err
+	}
+	return recoveredIndex, nil
+}
+
+func (rsm *RSM) truncateWALAsync(upToIndex int) {
+	if upToIndex <= 0 || rsm.walLogger == nil || !rsm.walLogger.Enabled() {
+		return
+	}
+	if !rsm.walGCInFly.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer rsm.walGCInFly.Store(false)
+		if err := rsm.walLogger.TruncateUpTo(int64(upToIndex)); err != nil {
+			log.Printf("[RSM-%d] WAL truncate failed upTo=%d: %v", rsm.me, upToIndex, err)
+		}
+	}()
 }
 
 // GetWatchManager 返回 Watch 管理器
@@ -364,6 +463,11 @@ func (rsm *RSM) applyCommand(msg kvraftapi.ApplyMsg) {
 	}
 
 	result := rsm.sm.DoOp(oper.Req)
+	rsm.mu.Lock()
+	if msg.CommandIndex > rsm.lastApplied {
+		rsm.lastApplied = msg.CommandIndex
+	}
+	rsm.mu.Unlock()
 
 	// 关键：在状态机应用操作后，立即调用监听器
 	// 这确保 Watch 事件的线性一致性（在 CommandValid 之后）
@@ -435,6 +539,16 @@ func (rsm *RSM) applySnapshot(msg kvraftapi.ApplyMsg) {
 		atomic.StoreInt64(&rsm.idCounter, idctr)
 	}
 	rsm.sm.Restore(smSnapshot)
+	rsm.mu.Lock()
+	if msg.SnapshotIndex > rsm.lastSnapIndex {
+		rsm.lastSnapIndex = msg.SnapshotIndex
+	}
+	if msg.SnapshotIndex > rsm.lastApplied {
+		rsm.lastApplied = msg.SnapshotIndex
+	}
+	rsm.lastSnapAt = time.Now()
+	rsm.mu.Unlock()
+	rsm.truncateWALAsync(msg.SnapshotIndex)
 }
 
 func (rsm *RSM) createSnapshot(lastIncludedIndex int) {
@@ -449,13 +563,12 @@ func (rsm *RSM) createSnapshot(lastIncludedIndex int) {
 	e.Encode(idctr)
 	e.Encode(smSnapshot)
 	rsm.rf.Snapshot(lastIncludedIndex, w.Bytes())
+	rsm.truncateWALAsync(lastIncludedIndex)
 	rsm.mu.Lock()
 	rsm.lastSnapIndex = lastIncludedIndex
+	if lastIncludedIndex > rsm.lastApplied {
+		rsm.lastApplied = lastIncludedIndex
+	}
 	rsm.lastSnapAt = time.Now()
 	rsm.mu.Unlock()
-	if rsm.walLogger != nil {
-		if err := rsm.walLogger.TruncateUpTo(int64(lastIncludedIndex)); err != nil {
-			log.Printf("[RSM-%d] WAL truncate failed at snapshot index=%d: %v", rsm.me, lastIncludedIndex, err)
-		}
-	}
 }

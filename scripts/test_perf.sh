@@ -72,6 +72,40 @@ build_addr_csv() {
   echo "${result}"
 }
 
+wait_port_ready() {
+  local host="$1"
+  local port="$2"
+  local timeout_sec="$3"
+  local start_ts now_ts
+  start_ts="$(date +%s)"
+  while true; do
+    if (echo >"/dev/tcp/${host}/${port}") >/dev/null 2>&1; then
+      return 0
+    fi
+    now_ts="$(date +%s)"
+    if (( now_ts - start_ts >= timeout_sec )); then
+      return 1
+    fi
+    sleep 0.1
+  done
+}
+
+wait_grpc_servers_ready() {
+  local csv="$1"
+  local timeout_sec="$2"
+  local ok=1
+  IFS=',' read -r -a addrs <<< "${csv}"
+  for addr in "${addrs[@]}"; do
+    local host="${addr%:*}"
+    local port="${addr##*:}"
+    if ! wait_port_ready "${host}" "${port}" "${timeout_sec}"; then
+      echo "gRPC 端口未就绪: ${addr}"
+      ok=0
+    fi
+  done
+  [[ "${ok}" -eq 1 ]]
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --servers)
@@ -236,7 +270,10 @@ fi
 
 # 重新读取运行时元数据，确保压测地址与当前集群一致。
 R_ARCH="$(runtime_value ARCH)"
+R_GROUPS="$(runtime_value GROUPS)"
+R_REPLICAS="$(runtime_value REPLICAS)"
 R_RAFT_SERVERS="$(runtime_value RAFT_SERVERS)"
+R_GRPC_SERVERS="$(runtime_value GRPC_SERVERS)"
 R_SHARDING_CONFIG="$(runtime_value SHARDING_CONFIG)"
 
 if [[ -n "${R_RAFT_SERVERS}" ]]; then
@@ -250,6 +287,35 @@ if [[ -n "${R_GRPC_SERVERS}" ]]; then
   STATUS_SERVERS="${R_GRPC_SERVERS}"
 else
   STATUS_SERVERS="$(build_addr_csv "${SERVERS}" "$((R_BASE_PORT + 1000))")"
+fi
+
+if ! wait_grpc_servers_ready "${STATUS_SERVERS}" 8; then
+  echo "检测到 gRPC 端口不可达，尝试自动重启集群后重试..."
+  ./scripts/stop_cluster.sh >/dev/null 2>&1 || true
+  CLEAN=true
+  start_cluster
+
+  R_ARCH="$(runtime_value ARCH)"
+  R_RAFT_SERVERS="$(runtime_value RAFT_SERVERS)"
+  R_GRPC_SERVERS="$(runtime_value GRPC_SERVERS)"
+  R_SHARDING_CONFIG="$(runtime_value SHARDING_CONFIG)"
+
+  if [[ -n "${R_RAFT_SERVERS}" ]]; then
+    RPC_SERVERS="${R_RAFT_SERVERS}"
+    SERVERS="$(csv_count "${RPC_SERVERS}")"
+  else
+    RPC_SERVERS="$(build_addr_csv "${SERVERS}" "${R_BASE_PORT}")"
+  fi
+  if [[ -n "${R_GRPC_SERVERS}" ]]; then
+    STATUS_SERVERS="${R_GRPC_SERVERS}"
+  else
+    STATUS_SERVERS="$(build_addr_csv "${SERVERS}" "$((R_BASE_PORT + 1000))")"
+  fi
+
+  if ! wait_grpc_servers_ready "${STATUS_SERVERS}" 8; then
+    echo "错误: 集群 gRPC 端口仍不可达，请检查 data/cluster/logs/*.log"
+    exit 1
+  fi
 fi
 
 if [[ "${SHARDED_MODE}" == "auto" ]]; then
@@ -395,12 +461,20 @@ run_regression_suite() {
   echo "回归测试完成，汇总: ${csv_file}"
 }
 
+post_cleanup() {
+  if [[ -x "./scripts/cleanup_artifacts.sh" ]]; then
+    ./scripts/cleanup_artifacts.sh >/dev/null 2>&1 || true
+  fi
+}
+
 if [[ "${REGRESSION}" == "true" ]]; then
   echo "开始执行回归模式..."
   run_regression_suite
+  post_cleanup
   exit 0
 fi
 
 "${bench_cmd[@]}" | tee "${report_file}"
+post_cleanup
 
 echo "压测完成，集群保持运行。"

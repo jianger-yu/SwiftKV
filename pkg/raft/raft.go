@@ -150,6 +150,32 @@ func (rf *Raft) GetState() (int, bool) {
 	return rf.CurrentTerm, rf.state == Leader
 }
 
+// GetLastIncludedIndex 返回当前快照覆盖到的最大日志索引。
+func (rf *Raft) GetLastIncludedIndex() int {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.lastIncludedIndex
+}
+
+// SyncAppliedIndex 在状态机外部恢复完成后对齐 Raft 的进度。
+func (rf *Raft) SyncAppliedIndex(index int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if index < rf.lastIncludedIndex {
+		index = rf.lastIncludedIndex
+	}
+	if index > rf.getLastLogIndex() {
+		index = rf.getLastLogIndex()
+	}
+	if index > rf.CommitIndex {
+		rf.CommitIndex = index
+	}
+	if index > rf.LastApplied {
+		rf.LastApplied = index
+	}
+}
+
 // IsLeaderWithLease returns true only when this node is leader and the lease is still valid.
 func (rf *Raft) IsLeaderWithLease() bool {
 	rf.mu.Lock()

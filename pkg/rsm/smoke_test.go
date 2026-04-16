@@ -1,9 +1,13 @@
 package rsm
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
+	"strconv"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -12,6 +16,71 @@ import (
 	"kvraft/pkg/storage"
 	"kvraft/pkg/watch"
 )
+
+const (
+	defaultRSMTestMaxDirs  = 64
+	defaultRSMTestMaxAgeHr = 72
+)
+
+var rsmTestCleanupOnce sync.Once
+
+func parsePositiveEnvInt(key string, fallback int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return fallback
+	}
+	return n
+}
+
+func pruneRSMTestData(base string) {
+	entries, err := os.ReadDir(base)
+	if err != nil {
+		return
+	}
+
+	maxDirs := parsePositiveEnvInt("RSM_TEST_MAX_DIRS", defaultRSMTestMaxDirs)
+	maxAgeHours := parsePositiveEnvInt("RSM_TEST_MAX_AGE_HOURS", defaultRSMTestMaxAgeHr)
+	maxAge := time.Duration(maxAgeHours) * time.Hour
+
+	type dirInfo struct {
+		name    string
+		modTime time.Time
+	}
+
+	dirs := make([]dirInfo, 0, len(entries))
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if len(name) < len("test-db-") || name[:len("test-db-")] != "test-db-" {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		dirs = append(dirs, dirInfo{name: name, modTime: info.ModTime()})
+	}
+
+	sort.Slice(dirs, func(i, j int) bool {
+		return dirs[i].modTime.After(dirs[j].modTime)
+	})
+
+	now := time.Now()
+	for i, d := range dirs {
+		removeByCount := i >= maxDirs
+		removeByAge := now.Sub(d.modTime) > maxAge
+		if !removeByCount && !removeByAge {
+			continue
+		}
+		_ = os.RemoveAll(filepath.Join(base, d.name))
+	}
+}
 
 func rsmTestStorePath(t *testing.T, name string) string {
 	t.Helper()
@@ -23,7 +92,16 @@ func rsmTestStorePath(t *testing.T, name string) string {
 	if err := os.MkdirAll(base, 0o755); err != nil {
 		t.Fatalf("create test data dir failed: %v", err)
 	}
-	path := filepath.Join(base, name+"-"+time.Now().Format("20060102-150405.000000000"))
+	rsmTestCleanupOnce.Do(func() {
+		pruneRSMTestData(base)
+	})
+	stamp := time.Now().Format("20060102-150405.000000000")
+	path := filepath.Join(base, fmt.Sprintf("%s-%s", name, stamp))
+	if os.Getenv("KEEP_RSM_TEST_DIRS") == "" {
+		t.Cleanup(func() {
+			_ = os.RemoveAll(path)
+		})
+	}
 	return path
 }
 

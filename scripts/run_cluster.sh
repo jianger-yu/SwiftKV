@@ -27,6 +27,49 @@ SHARD_GROUPS=1
 REPLICAS=3
 BASE_PORT=15000
 CLEAN=0
+PRUNE_STALE=${KV_PRUNE_STALE_ARCH_DATA:-1}
+
+prune_node_ring_dirs() {
+    local root="$1"
+    local keep_nodes="$2"
+    [[ -d "${root}" ]] || return 0
+    shopt -s nullglob
+    for d in "${root}"/node-*; do
+        [[ -d "${d}" ]] || continue
+        local name="${d##*/}"
+        local idx="${name#node-}"
+        if [[ ! "${idx}" =~ ^[0-9]+$ ]]; then
+            continue
+        fi
+        if (( idx >= keep_nodes )); then
+            echo "清理冗余 node-ring 数据目录: ${d}"
+            rm -rf "${d}"
+        fi
+    done
+    shopt -u nullglob
+}
+
+prune_group_ring_dirs() {
+    local root="$1"
+    local keep_groups="$2"
+    local keep_replicas="$3"
+    [[ -d "${root}" ]] || return 0
+    shopt -s nullglob
+    for d in "${root}"/g*-n*; do
+        [[ -d "${d}" ]] || continue
+        local name="${d##*/}"
+        if [[ ! "${name}" =~ ^g([0-9]+)-n([0-9]+)$ ]]; then
+            continue
+        fi
+        local gid="${BASH_REMATCH[1]}"
+        local rid="${BASH_REMATCH[2]}"
+        if (( gid >= keep_groups || rid >= keep_replicas )); then
+            echo "清理冗余 group-ring 数据目录: ${d}"
+            rm -rf "${d}"
+        fi
+    done
+    shopt -u nullglob
+}
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -77,6 +120,11 @@ for pid_file in "${PID_DIR}"/*.pid; do
     fi
 done
 
+if [[ "${PRUNE_STALE}" == "1" ]]; then
+    prune_node_ring_dirs "${DATA_ROOT}/arch-node-ring" "${SERVERS}"
+    prune_group_ring_dirs "${DATA_ROOT}/arch-group-ring" "${SHARD_GROUPS}" "${REPLICAS}"
+fi
+
 echo "编译服务端二进制..."
 cd "${ROOT_DIR}"
 go build -o "${SERVER_BIN}" ./cmd/server
@@ -93,6 +141,24 @@ append_csv() {
     else
         printf -v "${var_name}" '%s' "${current},${value}"
     fi
+}
+
+wait_port_ready() {
+    local host="$1"
+    local port="$2"
+    local timeout_sec="$3"
+    local start_ts now_ts
+    start_ts="$(date +%s)"
+    while true; do
+        if (echo >"/dev/tcp/${host}/${port}") >/dev/null 2>&1; then
+            return 0
+        fi
+        now_ts="$(date +%s)"
+        if (( now_ts - start_ts >= timeout_sec )); then
+            return 1
+        fi
+        sleep 0.1
+    done
 }
 
 if [[ "${ARCH}" == "node-ring" ]]; then
@@ -114,6 +180,9 @@ if [[ "${ARCH}" == "node-ring" ]]; then
         metrics_port=$((19100 + i))
 
         if [[ "${CLEAN}" -eq 1 ]]; then
+            if [[ "${i}" -eq 0 ]]; then
+                rm -rf "${DATA_ROOT}/arch-node-ring"
+            fi
             rm -rf "${DATA_ROOT}/arch-node-ring/node-${i}"
         fi
 
@@ -126,7 +195,7 @@ if [[ "${ARCH}" == "node-ring" ]]; then
         REST_LISTEN="127.0.0.1:${rest_port}" \
         METRICS_LISTEN="127.0.0.1:${metrics_port}" \
         KV_DATA_DIR="${DATA_ROOT}/arch-node-ring/node-${i}" \
-        "${SERVER_BIN}" >"${log_file}" 2>&1 &
+        nohup "${SERVER_BIN}" >"${log_file}" 2>&1 &
 
         echo "$!" > "${pid_file}"
         append_csv RAFT_SERVERS "127.0.0.1:${rpc_port}"
@@ -153,6 +222,9 @@ else
             metrics_port=$((19100 + global_idx))
 
             if [[ "${CLEAN}" -eq 1 ]]; then
+                if [[ "${g}" -eq 0 && "${r}" -eq 0 ]]; then
+                    rm -rf "${DATA_ROOT}/arch-group-ring"
+                fi
                 rm -rf "${DATA_ROOT}/arch-group-ring/g${g}-n${r}"
             fi
 
@@ -165,7 +237,7 @@ else
             REST_LISTEN="127.0.0.1:${rest_port}" \
             METRICS_LISTEN="127.0.0.1:${metrics_port}" \
             KV_DATA_DIR="${DATA_ROOT}/arch-group-ring/g${g}-n${r}" \
-            "${SERVER_BIN}" >"${log_file}" 2>&1 &
+            nohup "${SERVER_BIN}" >"${log_file}" 2>&1 &
 
             echo "$!" > "${pid_file}"
             append_csv RAFT_SERVERS "127.0.0.1:${rpc_port}"
@@ -182,6 +254,21 @@ for pid_file in "${PID_DIR}"/*.pid; do
     pid="$(cat "${pid_file}")"
     if ! kill -0 "${pid}" 2>/dev/null; then
         echo "节点启动失败，请检查日志: ${pid_file}"
+        exit 1
+    fi
+done
+
+IFS=',' read -r -a grpc_addrs <<< "${GRPC_SERVERS}"
+for addr in "${grpc_addrs[@]}"; do
+    host="${addr%:*}"
+    port="${addr##*:}"
+    if ! wait_port_ready "${host}" "${port}" 8; then
+        echo "节点 gRPC 端口未就绪: ${addr}"
+        echo "最近日志:"
+        ls -1t "${LOG_DIR}"/*.log 2>/dev/null | head -n 3 | while read -r f; do
+            echo "===== ${f} ====="
+            tail -n 40 "${f}" || true
+        done
         exit 1
     fi
 done

@@ -491,7 +491,6 @@ func (s *ServerStats) GetStats() (requests, writes, reads, failures int64) {
 }
 
 // 服务器启动
-
 func StartKVServer(servers []string, gid int, me int, persister Persister, maxraftstate int, address string) *KVServer {
 	gob.Register(Op{})
 	gob.Register(kvraftapi.PutArgs{})
