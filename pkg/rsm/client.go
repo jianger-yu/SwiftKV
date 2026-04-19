@@ -331,7 +331,7 @@ func (ck *Clerk) Get(key string) (string, kvraftapi.Tversion, int64, kvraftapi.E
 
 			attempts++
 			if attempts > 100 {
-				fmt.Printf("\n⚠️  Get 已尝试 %d 次，仍无可用服务器\n", attempts)
+				fmt.Printf("\n Get 已尝试 %d 次，仍无可用服务器\n", attempts)
 				fmt.Println("提示: 请确保 KVraft 服务器已启动:")
 				return "", 0, 0, kvraftapi.ErrWrongLeader
 			}

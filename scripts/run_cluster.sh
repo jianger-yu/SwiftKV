@@ -131,6 +131,7 @@ go build -o "${SERVER_BIN}" ./cmd/server
 
 RAFT_SERVERS=""
 GRPC_SERVERS=""
+PPROF_SERVERS=""
 
 append_csv() {
     local var_name="$1"
@@ -178,6 +179,7 @@ if [[ "${ARCH}" == "node-ring" ]]; then
         grpc_port=$((rpc_port + 1000))
         rest_port=$((18080 + i))
         metrics_port=$((19100 + i))
+        pprof_port=$((17060 + i))
 
         if [[ "${CLEAN}" -eq 1 ]]; then
             if [[ "${i}" -eq 0 ]]; then
@@ -194,12 +196,14 @@ if [[ "${ARCH}" == "node-ring" ]]; then
         RAFT_PEERS="${node_ring_peers}" \
         REST_LISTEN="127.0.0.1:${rest_port}" \
         METRICS_LISTEN="127.0.0.1:${metrics_port}" \
+        PPROF_LISTEN="127.0.0.1:${pprof_port}" \
         KV_DATA_DIR="${DATA_ROOT}/arch-node-ring/node-${i}" \
         nohup "${SERVER_BIN}" >"${log_file}" 2>&1 &
 
         echo "$!" > "${pid_file}"
         append_csv RAFT_SERVERS "127.0.0.1:${rpc_port}"
         append_csv GRPC_SERVERS "127.0.0.1:${grpc_port}"
+        append_csv PPROF_SERVERS "127.0.0.1:${pprof_port}"
     done
 else
     TOTAL_NODES=$((SHARD_GROUPS * REPLICAS))
@@ -220,6 +224,7 @@ else
             grpc_port=$((rpc_port + 1000))
             rest_port=$((18080 + global_idx))
             metrics_port=$((19100 + global_idx))
+            pprof_port=$((17060 + global_idx))
 
             if [[ "${CLEAN}" -eq 1 ]]; then
                 if [[ "${g}" -eq 0 && "${r}" -eq 0 ]]; then
@@ -236,12 +241,14 @@ else
             RAFT_PEERS="${peers}" \
             REST_LISTEN="127.0.0.1:${rest_port}" \
             METRICS_LISTEN="127.0.0.1:${metrics_port}" \
+            PPROF_LISTEN="127.0.0.1:${pprof_port}" \
             KV_DATA_DIR="${DATA_ROOT}/arch-group-ring/g${g}-n${r}" \
             nohup "${SERVER_BIN}" >"${log_file}" 2>&1 &
 
             echo "$!" > "${pid_file}"
             append_csv RAFT_SERVERS "127.0.0.1:${rpc_port}"
             append_csv GRPC_SERVERS "127.0.0.1:${grpc_port}"
+            append_csv PPROF_SERVERS "127.0.0.1:${pprof_port}"
             global_idx=$((global_idx + 1))
         done
     done
@@ -283,6 +290,7 @@ done
     echo "TOTAL_NODES=${TOTAL_NODES}"
     echo "RAFT_SERVERS=${RAFT_SERVERS}"
     echo "GRPC_SERVERS=${GRPC_SERVERS}"
+    echo "PPROF_SERVERS=${PPROF_SERVERS}"
     echo "SHARDING_CONFIG=${SHARDING_JSON}"
     echo "SHARDING_NEXT_CONFIG=${CLUSTER_DIR}/sharding.next.json"
 } > "${RUNTIME_ENV}"

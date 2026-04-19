@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -106,6 +107,23 @@ func startMetricsHTTP(addr string, kv *rsm.KVServer) *http.Server {
 	return srv
 }
 
+func startPprofHTTP(addr string) *http.Server {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/debug/pprof/", pprof.Index)
+	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+
+	srv := &http.Server{Addr: addr, Handler: mux}
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Printf("pprof server stopped on %s: %v", addr, err)
+		}
+	}()
+	return srv
+}
+
 func main() {
 	nodeID := getenvInt("NODE_ID", 0)
 	peers := strings.TrimSpace(os.Getenv("RAFT_PEERS"))
@@ -123,6 +141,7 @@ func main() {
 	rpcAddr := servers[nodeID]
 	httpAddr := getenvStr("REST_LISTEN", "0.0.0.0:8001")
 	metricsAddr := getenvStr("METRICS_LISTEN", "0.0.0.0:9100")
+	pprofAddr := getenvStr("PPROF_LISTEN", "")
 	maxRaftState := getenvInt("MAX_RAFT_STATE", 1048576)
 
 	dataDir := filepath.Join(runtimeDataRoot(), fmt.Sprintf("node-%d", nodeID))
@@ -133,10 +152,14 @@ func main() {
 	defer persister.Close()
 
 	kv := rsm.StartKVServer(servers, 1, nodeID, persister, maxRaftState, rpcAddr)
-	log.Printf("kvraft node started: node_id=%d rpc=%s rest=%s metrics=%s", nodeID, rpcAddr, httpAddr, metricsAddr)
+	log.Printf("kvraft node started: node_id=%d rpc=%s rest=%s metrics=%s pprof=%s", nodeID, rpcAddr, httpAddr, metricsAddr, pprofAddr)
 
 	httpSrv := startHTTP(httpAddr, kv)
 	metricsSrv := startMetricsHTTP(metricsAddr, kv)
+	var pprofSrv *http.Server
+	if pprofAddr != "" {
+		pprofSrv = startPprofHTTP(pprofAddr)
+	}
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -151,6 +174,11 @@ func main() {
 	if metricsSrv != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		_ = metricsSrv.Shutdown(ctx)
+		cancel()
+	}
+	if pprofSrv != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		_ = pprofSrv.Shutdown(ctx)
 		cancel()
 	}
 	kv.Kill()
