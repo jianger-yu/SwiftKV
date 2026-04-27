@@ -2,6 +2,7 @@ package rsm
 
 import (
 	"encoding/gob"
+	"kvraft/pkg/raft"
 	kvraftapi "kvraft/pkg/raftapi"
 	"kvraft/pkg/storage"
 	"kvraft/pkg/watch"
@@ -86,6 +87,12 @@ type ServerStats struct {
 	LeaseHits      int64 // 租约命中次数
 	LeaseFallbacks int64 // 租约回退（降级）次数
 	TTLExpiredOps  int64 // TTL过期而删除的键数
+}
+
+type RuntimePerfStats struct {
+	Persister PersisterMetrics
+	Raft      raft.RaftPerfStats
+	ApplyLoop ApplyLoopPerfStats
 }
 
 // 核心业务逻辑 - Do Op (执行状态机操作)
@@ -449,6 +456,22 @@ func (kv *KVServer) StatsSnapshot() ServerStats {
 		LeaseFallbacks: atomic.LoadInt64(&kv.stats.LeaseFallbacks),
 		TTLExpiredOps:  atomic.LoadInt64(&kv.stats.TTLExpiredOps),
 	}
+}
+
+func (kv *KVServer) PerfSnapshot() RuntimePerfStats {
+	perf := RuntimePerfStats{}
+	if kv == nil || kv.rsm == nil {
+		return perf
+	}
+
+	perf.ApplyLoop = kv.rsm.ApplyLoopPerfStatsSnapshot()
+	if rfImpl, ok := kv.rsm.rf.(*raft.Raft); ok {
+		perf.Raft = rfImpl.PerfStatsSnapshot()
+	}
+	if fp, ok := kv.rsm.persister.(*FilePersister); ok {
+		perf.Persister = fp.MetricsSnapshot()
+	}
+	return perf
 }
 
 // 统计方法

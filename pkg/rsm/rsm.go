@@ -24,7 +24,11 @@ type Persister interface {
 	ReadRaftState() []byte
 	ReadHardState() []byte
 	ReadSnapshot() []byte
+	EnqueueSave(raftstate []byte, snapshot []byte) <-chan error
+	EnqueueAppendRaftState(data []byte) <-chan error
+	EnqueueSaveHardState(hardstate []byte) <-chan error
 	Save(raftstate []byte, snapshot []byte)
+	AppendRaftState(data []byte)
 	SaveHardState(hardstate []byte)
 	RaftStateSize() int
 }
@@ -64,6 +68,14 @@ type waitingOp struct {
 	done   chan bool // 操作完成的信号通道
 }
 
+type ApplyLoopPerfStats struct {
+	BlockedNanos    int64
+	ProcessNanos    int64
+	IterationCount  int64
+	BlockedAvgNanos float64
+	ProcessAvgNanos float64
+}
+
 type RSM struct {
 	mu            sync.Mutex
 	me            int
@@ -86,6 +98,10 @@ type RSM struct {
 	lastSnapAt    time.Time
 	snapMinDelta  int
 	snapMinGap    time.Duration
+
+	applyLoopBlockedNanos int64
+	applyLoopProcessNanos int64
+	applyLoopIterCount    int64
 }
 
 func leaseReadEnabledFromEnv() bool {
@@ -390,6 +406,27 @@ func (rsm *RSM) RegisterOpCompleteListener(listener OpCompleteListener) {
 	rsm.opListener = listener
 }
 
+func (rsm *RSM) ApplyLoopPerfStatsSnapshot() ApplyLoopPerfStats {
+	blockedNanos := atomic.LoadInt64(&rsm.applyLoopBlockedNanos)
+	processNanos := atomic.LoadInt64(&rsm.applyLoopProcessNanos)
+	iterCount := atomic.LoadInt64(&rsm.applyLoopIterCount)
+
+	avg := func(total int64, count int64) float64 {
+		if count <= 0 {
+			return 0
+		}
+		return float64(total) / float64(count)
+	}
+
+	return ApplyLoopPerfStats{
+		BlockedNanos:    blockedNanos,
+		ProcessNanos:    processNanos,
+		IterationCount:  iterCount,
+		BlockedAvgNanos: avg(blockedNanos, iterCount),
+		ProcessAvgNanos: avg(processNanos, iterCount),
+	}
+}
+
 // Submit 向 Raft 提交一条命令并等待其被提交。
 // 如果当前节点不是 Leader，返回 ErrWrongLeader，客户端应重新查找 Leader 后重试。
 func (rsm *RSM) Submit(req any) (kvraftapi.Err, any) {
@@ -467,7 +504,9 @@ func (rsm *RSM) kill() {
 
 func (rsm *RSM) applyLoop() {
 	for {
+		waitStarted := time.Now()
 		msg, ok := <-rsm.applyCh
+		atomic.AddInt64(&rsm.applyLoopBlockedNanos, time.Since(waitStarted).Nanoseconds())
 		if !ok {
 			rsm.kill()
 			return
@@ -475,11 +514,14 @@ func (rsm *RSM) applyLoop() {
 		if rsm.shutdown.Load() {
 			return
 		}
+		processStarted := time.Now()
 		if msg.CommandValid {
 			rsm.applyCommand(msg)
 		} else {
 			rsm.applySnapshot(msg)
 		}
+		atomic.AddInt64(&rsm.applyLoopProcessNanos, time.Since(processStarted).Nanoseconds())
+		atomic.AddInt64(&rsm.applyLoopIterCount, 1)
 	}
 }
 
@@ -492,7 +534,7 @@ func (rsm *RSM) applyCommand(msg kvraftapi.ApplyMsg) {
 
 	term, _ := rsm.rf.GetState()
 	if rsm.walLogger != nil {
-		if err := rsm.walLogger.Append(walEntryFromOp(rsm.me, msg.CommandIndex, term, oper)); err != nil {
+		if err := rsm.walLogger.AppendAsync(walEntryFromOp(rsm.me, msg.CommandIndex, term, oper)); err != nil {
 			log.Printf("[RSM-%d] WAL append failed at index=%d: %v", rsm.me, msg.CommandIndex, err)
 		}
 	}

@@ -17,6 +17,7 @@ RUNTIME_ENV="${DATA_ROOT}/cluster/runtime.env"
 mkdir -p "${PERF_DIR}"
 
 SERVERS=3
+SERVERS_EXPLICIT=false
 CLIENTS=10
 REQUESTS=1000
 READ_RATIO=0.7
@@ -110,6 +111,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --servers)
       SERVERS="$2"
+      SERVERS_EXPLICIT=true
       shift 2
       ;;
     --clients)
@@ -227,7 +229,7 @@ fi
 if [[ -z "${REPLICAS}" ]]; then
   REPLICAS="${R_REPLICAS:-3}"
 fi
-if [[ -n "${R_TOTAL_NODES}" && "${SERVERS}" == "3" ]]; then
+if [[ "${SERVERS_EXPLICIT}" != "true" && -n "${R_TOTAL_NODES}" && "${SERVERS}" == "3" ]]; then
   SERVERS="${R_TOTAL_NODES}"
 fi
 
@@ -252,7 +254,7 @@ if [[ "${RESTART_CLUSTER}" == "true" ]]; then
   start_cluster
 else
   CHECK_SERVERS="${R_GRPC_SERVERS}"
-  if [[ -z "${CHECK_SERVERS}" ]]; then
+  if [[ "${SERVERS_EXPLICIT}" == "true" || -z "${CHECK_SERVERS}" ]]; then
     CHECK_SERVERS="$(build_addr_csv "${SERVERS}" "$((R_BASE_PORT + 1000))")"
   fi
 
@@ -276,14 +278,18 @@ R_RAFT_SERVERS="$(runtime_value RAFT_SERVERS)"
 R_GRPC_SERVERS="$(runtime_value GRPC_SERVERS)"
 R_SHARDING_CONFIG="$(runtime_value SHARDING_CONFIG)"
 
-if [[ -n "${R_RAFT_SERVERS}" ]]; then
+if [[ "${SERVERS_EXPLICIT}" == "true" ]]; then
+  RPC_SERVERS="$(build_addr_csv "${SERVERS}" "${R_BASE_PORT}")"
+elif [[ -n "${R_RAFT_SERVERS}" ]]; then
   RPC_SERVERS="${R_RAFT_SERVERS}"
   SERVERS="$(csv_count "${RPC_SERVERS}")"
 else
   RPC_SERVERS="$(build_addr_csv "${SERVERS}" "${R_BASE_PORT}")"
 fi
 
-if [[ -n "${R_GRPC_SERVERS}" ]]; then
+if [[ "${SERVERS_EXPLICIT}" == "true" ]]; then
+  STATUS_SERVERS="$(build_addr_csv "${SERVERS}" "$((R_BASE_PORT + 1000))")"
+elif [[ -n "${R_GRPC_SERVERS}" ]]; then
   STATUS_SERVERS="${R_GRPC_SERVERS}"
 else
   STATUS_SERVERS="$(build_addr_csv "${SERVERS}" "$((R_BASE_PORT + 1000))")"
@@ -300,13 +306,17 @@ if ! wait_grpc_servers_ready "${STATUS_SERVERS}" 8; then
   R_GRPC_SERVERS="$(runtime_value GRPC_SERVERS)"
   R_SHARDING_CONFIG="$(runtime_value SHARDING_CONFIG)"
 
-  if [[ -n "${R_RAFT_SERVERS}" ]]; then
+  if [[ "${SERVERS_EXPLICIT}" == "true" ]]; then
+    RPC_SERVERS="$(build_addr_csv "${SERVERS}" "${R_BASE_PORT}")"
+  elif [[ -n "${R_RAFT_SERVERS}" ]]; then
     RPC_SERVERS="${R_RAFT_SERVERS}"
     SERVERS="$(csv_count "${RPC_SERVERS}")"
   else
     RPC_SERVERS="$(build_addr_csv "${SERVERS}" "${R_BASE_PORT}")"
   fi
-  if [[ -n "${R_GRPC_SERVERS}" ]]; then
+  if [[ "${SERVERS_EXPLICIT}" == "true" ]]; then
+    STATUS_SERVERS="$(build_addr_csv "${SERVERS}" "$((R_BASE_PORT + 1000))")"
+  elif [[ -n "${R_GRPC_SERVERS}" ]]; then
     STATUS_SERVERS="${R_GRPC_SERVERS}"
   else
     STATUS_SERVERS="$(build_addr_csv "${SERVERS}" "$((R_BASE_PORT + 1000))")"

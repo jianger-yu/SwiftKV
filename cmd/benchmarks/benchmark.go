@@ -26,6 +26,7 @@ import (
 // BenchmarkConfig 描述压测配置。
 type BenchmarkConfig struct {
 	Servers          int           // 集群节点数
+	BasePort         int           // 内嵌集群起始端口
 	ServerAddrs      []string      // 外部集群地址列表（非空时不在进程内拉起集群）
 	ShardingConfig   string        // 分片配置文件路径（sharded=true 时优先生效）
 	Clients          int           // 并发客户端数
@@ -152,6 +153,9 @@ func RunRealBenchmark(ctx context.Context, cfg BenchmarkConfig) (BenchmarkResult
 	if cfg.Servers <= 0 {
 		cfg.Servers = 3
 	}
+	if cfg.BasePort <= 0 {
+		cfg.BasePort = 15000
+	}
 	if cfg.Clients <= 0 {
 		cfg.Clients = 10
 	}
@@ -184,7 +188,7 @@ func RunRealBenchmark(ctx context.Context, cfg BenchmarkConfig) (BenchmarkResult
 		cfg.Servers = len(servers)
 	} else {
 		for i := 0; i < cfg.Servers; i++ {
-			servers = append(servers, fmt.Sprintf("127.0.0.1:%d", 15000+i))
+			servers = append(servers, fmt.Sprintf("127.0.0.1:%d", cfg.BasePort+i))
 		}
 	}
 
@@ -483,8 +487,21 @@ func RunRealBenchmark(ctx context.Context, cfg BenchmarkConfig) (BenchmarkResult
 			continue
 		}
 		s := kv.StatsSnapshot()
+		perf := kv.PerfSnapshot()
 		fmt.Printf("server[%d] stats: req=%d read=%d write=%d lease_hit=%d lease_fallback=%d fail=%d\n",
 			i, s.TotalRequests, s.TotalReads, s.TotalWrites, s.LeaseHits, s.LeaseFallbacks, s.FailedRequests)
+		fmt.Printf("server[%d] perf: fsync=%d fsync/s=%.2f avg_batch(save/append/hard)=%.2f/%.2f/%.2f rf.mu_wait_avg=%.3fms persist_wait_avg=%.3fms apply_block_avg=%.3fms apply_process_avg=%.3fms\n",
+			i,
+			perf.Persister.FsyncCount,
+			perf.Persister.FsyncPerSecond,
+			perf.Persister.AvgSaveBatch,
+			perf.Persister.AvgAppendBatch,
+			perf.Persister.AvgHardBatch,
+			perf.Raft.MuWaitAvgNanos/1e6,
+			perf.Raft.PersistWaitAvgNanos/1e6,
+			perf.ApplyLoop.BlockedAvgNanos/1e6,
+			perf.ApplyLoop.ProcessAvgNanos/1e6,
+		)
 		leaseStatsEnabled := strings.EqualFold(strings.TrimSpace(os.Getenv("KV_LEASE_STATS")), "1") ||
 			strings.EqualFold(strings.TrimSpace(os.Getenv("KV_LEASE_STATS")), "true") ||
 			strings.EqualFold(strings.TrimSpace(os.Getenv("KV_LEASE_STATS")), "yes") ||
@@ -516,6 +533,7 @@ func RunRealBenchmark(ctx context.Context, cfg BenchmarkConfig) (BenchmarkResult
 
 func main() {
 	servers := flag.Int("servers", 3, "KVraft 集群节点数")
+	basePort := flag.Int("port-base", 15000, "内嵌集群起始 RPC 端口（external 模式忽略）")
 	serverAddrs := flag.String("server-addrs", "", "外部集群 rpc 地址列表，逗号分隔（设置后不会自动启动/关闭集群）")
 	shardingConfig := flag.String("sharding-config", "", "分片配置文件路径（sharded=true 时建议传入 data/cluster/sharding.json）")
 	clients := flag.Int("clients", 10, "并发客户端数")
@@ -541,6 +559,7 @@ func main() {
 
 	cfg := BenchmarkConfig{
 		Servers:          *servers,
+		BasePort:         *basePort,
 		ServerAddrs:      parsedAddrs,
 		ShardingConfig:   *shardingConfig,
 		Clients:          *clients,

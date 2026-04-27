@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -33,14 +34,19 @@ type ShardingConfig struct {
 
 // ShardRouter 基于一致性哈希将请求路由到对应分组。
 type ShardRouter struct {
-	mu           sync.RWMutex
-	config       ShardingConfig
-	hashRing     *ConsistentHash
-	groupClients map[int]map[string]pb.KVServiceClient
-	groupConns   map[int]map[string]*grpc.ClientConn
-	groupsByID   map[int]RaftGroupConfig
-	leaderCache  map[int]string
+	mu                   sync.RWMutex
+	config               ShardingConfig
+	hashRing             *ConsistentHash
+	groupClients         map[int]map[string]pb.KVServiceClient
+	groupConns           map[int]map[string]*grpc.ClientConn
+	groupsByID           map[int]RaftGroupConfig
+	leaderCache          map[int]string
+	leaderCacheUpdatedAt map[int]time.Time
+	leaderCacheTTL       time.Duration
 }
+
+const defaultLeaderCacheTTL = 2 * time.Second
+const defaultPerReplicaRPCTimeout = 220 * time.Millisecond
 
 // WatchEventHandler 处理来自分片路由层的 Watch 事件。
 type WatchEventHandler func(groupID int, event *pb.WatchEvent)
@@ -68,12 +74,14 @@ func NewShardRouter(cfg ShardingConfig) (*ShardRouter, error) {
 	}
 
 	r := &ShardRouter{
-		config:       cfg,
-		hashRing:     NewConsistentHash(cfg.VirtualNodeCount),
-		groupConns:   make(map[int]map[string]*grpc.ClientConn),      // 物理连接池
-		groupClients: make(map[int]map[string]pb.KVServiceClient),    // 业务逻辑接口池
-		groupsByID:   make(map[int]RaftGroupConfig, len(cfg.Groups)), // 配置查找表
-		leaderCache:  make(map[int]string),                           // leader状态缓存表
+		config:               cfg,
+		hashRing:             NewConsistentHash(cfg.VirtualNodeCount),
+		groupConns:           make(map[int]map[string]*grpc.ClientConn),      // 物理连接池
+		groupClients:         make(map[int]map[string]pb.KVServiceClient),    // 业务逻辑接口池
+		groupsByID:           make(map[int]RaftGroupConfig, len(cfg.Groups)), // 配置查找表
+		leaderCache:          make(map[int]string),                           // leader状态缓存表
+		leaderCacheUpdatedAt: make(map[int]time.Time, len(cfg.Groups)),
+		leaderCacheTTL:       defaultLeaderCacheTTL,
 	}
 
 	// 构建分片映射
@@ -127,6 +135,7 @@ func (r *ShardRouter) initConnections() error {
 		leader := replicas[g.LeaderIdx%len(replicas)]
 		if _, ok := r.groupClients[g.GroupID][leader]; ok {
 			r.leaderCache[g.GroupID] = leader
+			r.leaderCacheUpdatedAt[g.GroupID] = time.Now()
 		}
 		if len(r.groupClients[g.GroupID]) == 0 {
 			return fmt.Errorf("group %d has no reachable replicas", g.GroupID)
@@ -175,14 +184,36 @@ func (r *ShardRouter) isWrongLeader(errText string) bool {
 	if errText == "" {
 		return false
 	}
-	return errText == "ErrWrongLeader"
+	s := strings.ToLower(strings.TrimSpace(errText))
+	return strings.Contains(s, "errwrongleader") ||
+		strings.Contains(s, "wrong leader") ||
+		strings.Contains(s, "wrongleader") ||
+		strings.Contains(s, "not leader") ||
+		strings.Contains(s, "leader changed")
 }
 
 func (r *ShardRouter) withRequestTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
-	if _, hasDeadline := ctx.Deadline(); hasDeadline {
-		return ctx, func() {}
+	if ddl, hasDeadline := ctx.Deadline(); hasDeadline {
+		remaining := time.Until(ddl)
+		if remaining <= 0 {
+			return context.WithCancel(ctx)
+		}
+
+		budget := remaining
+		if r.config.RequestTimeout > 0 && budget > r.config.RequestTimeout {
+			budget = r.config.RequestTimeout
+		}
+		if budget > defaultPerReplicaRPCTimeout {
+			budget = defaultPerReplicaRPCTimeout
+		}
+		return context.WithTimeout(ctx, budget)
 	}
-	return context.WithTimeout(ctx, r.config.RequestTimeout)
+
+	budget := r.config.RequestTimeout
+	if budget <= 0 || budget > defaultPerReplicaRPCTimeout {
+		budget = defaultPerReplicaRPCTimeout
+	}
+	return context.WithTimeout(ctx, budget)
 }
 
 func (r *ShardRouter) groupReplicaCandidates(gid int) []string {
@@ -197,7 +228,12 @@ func (r *ShardRouter) groupReplicaCandidates(gid int) []string {
 	seen := make(map[string]bool, len(g.Replicas))   // 地址去重表
 	candidates := make([]string, 0, len(g.Replicas)) // 候选地址切片(作为函数输出)
 
-	if leader, ok := r.leaderCache[gid]; ok && leader != "" {
+	leader := r.leaderCache[gid]
+	if updatedAt, ok := r.leaderCacheUpdatedAt[gid]; ok && !updatedAt.IsZero() && time.Since(updatedAt) > r.leaderCacheTTL {
+		leader = ""
+	}
+
+	if leader != "" {
 		if _, exists := r.groupClients[gid][leader]; exists {
 			candidates = append(candidates, leader)
 			seen[leader] = true
@@ -216,6 +252,8 @@ func (r *ShardRouter) groupReplicaCandidates(gid int) []string {
 	}
 
 	maxCandidates := r.config.PreferredReplicas
+	// 多 group 场景不能硬性截断到前 2 个副本；
+	// 一旦真实 leader 落在第 3 副本，将导致持续 ErrWrongLeader 与重试风暴。
 	// 单 group 部署下必须尝试所有可用副本；
 	// 否则 leader 不在前 N 个副本时会出现持续 ErrWrongLeader。
 	if len(r.config.Groups) == 1 {
@@ -236,6 +274,18 @@ func (r *ShardRouter) setLeader(gid int, leaderAddr string) {
 	defer r.mu.Unlock()
 	if _, ok := r.groupClients[gid][leaderAddr]; ok {
 		r.leaderCache[gid] = leaderAddr
+		r.leaderCacheUpdatedAt[gid] = time.Now()
+	}
+}
+
+func (r *ShardRouter) invalidateLeader(gid int, leaderAddr string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if cur, ok := r.leaderCache[gid]; ok {
+		if leaderAddr == "" || cur == leaderAddr {
+			delete(r.leaderCache, gid)
+			delete(r.leaderCacheUpdatedAt, gid)
+		}
 	}
 }
 
@@ -255,14 +305,17 @@ func (r *ShardRouter) GetFromGroup(ctx context.Context, gid int, key string) (*p
 		cancel()
 
 		if rpcErr != nil {
+			r.invalidateLeader(gid, replica)
 			lastErr = rpcErr
 			continue
 		}
 		if resp == nil {
+			r.invalidateLeader(gid, replica)
 			lastErr = fmt.Errorf("empty get response from %s", replica)
 			continue
 		}
 		if r.isWrongLeader(resp.GetError()) {
+			r.invalidateLeader(gid, replica)
 			lastErr = fmt.Errorf("group %d wrong leader via %s", gid, replica)
 			continue
 		}
@@ -298,14 +351,17 @@ func (r *ShardRouter) PutToGroupWithTTL(ctx context.Context, gid int, key string
 		cancel()
 
 		if rpcErr != nil {
+			r.invalidateLeader(gid, replica)
 			lastErr = rpcErr
 			continue
 		}
 		if resp == nil {
+			r.invalidateLeader(gid, replica)
 			lastErr = fmt.Errorf("empty put response from %s", replica)
 			continue
 		}
 		if r.isWrongLeader(resp.GetError()) {
+			r.invalidateLeader(gid, replica)
 			lastErr = fmt.Errorf("group %d wrong leader via %s", gid, replica)
 			continue
 		}
@@ -336,14 +392,17 @@ func (r *ShardRouter) DeleteFromGroup(ctx context.Context, gid int, key string) 
 		cancel()
 
 		if rpcErr != nil {
+			r.invalidateLeader(gid, replica)
 			lastErr = rpcErr
 			continue
 		}
 		if resp == nil {
+			r.invalidateLeader(gid, replica)
 			lastErr = fmt.Errorf("empty delete response from %s", replica)
 			continue
 		}
 		if r.isWrongLeader(resp.GetError()) {
+			r.invalidateLeader(gid, replica)
 			lastErr = fmt.Errorf("group %d wrong leader via %s", gid, replica)
 			continue
 		}
@@ -374,14 +433,17 @@ func (r *ShardRouter) ScanGroup(ctx context.Context, gid int, prefix string, lim
 		cancel()
 
 		if rpcErr != nil {
+			r.invalidateLeader(gid, replica)
 			lastErr = rpcErr
 			continue
 		}
 		if resp == nil {
+			r.invalidateLeader(gid, replica)
 			lastErr = fmt.Errorf("empty scan response from %s", replica)
 			continue
 		}
 		if r.isWrongLeader(resp.GetError()) {
+			r.invalidateLeader(gid, replica)
 			lastErr = fmt.Errorf("group %d wrong leader via %s", gid, replica)
 			continue
 		}
@@ -629,6 +691,7 @@ func (r *ShardRouter) Close() {
 		delete(r.groupConns, gid)
 		delete(r.groupClients, gid)
 		delete(r.leaderCache, gid)
+		delete(r.leaderCacheUpdatedAt, gid)
 		delete(r.groupsByID, gid)
 	}
 }

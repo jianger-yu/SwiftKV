@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
-COMMIT_MSG="test: add support for pprof flame graph profiling"
+COMMIT_MSG="perf: 重构存储层为增量 WAL 模式，吞吐提升至 8942 ops/s | 实现 O(APPEND) 写入与差分状态合并算法，显著降低多组 Raft IO 竞争；压测显示读写比 7:3 场景下平均延迟仅 27.87ms，P99 261.24ms"
 RUN_TEST=1
 DRY_RUN=0
 
@@ -65,7 +65,18 @@ fi
 
 if [[ ${RUN_TEST} -eq 1 ]]; then
     echo "=== 1/4 Run tests ==="
-    bash scripts/test-all.sh
+    TEST_SCRIPT=""
+    if [[ -f scripts/test-all.sh ]]; then
+        TEST_SCRIPT="scripts/test-all.sh"
+    elif [[ -f scripts/test_all.sh ]]; then
+        TEST_SCRIPT="scripts/test_all.sh"
+    else
+        echo "Error: test script not found. Tried: scripts/test-all.sh, scripts/test_all.sh"
+        echo "Hint: current scripts directory contains:"
+        ls -1 scripts | sed 's/^/  - /'
+        exit 1
+    fi
+    bash "${TEST_SCRIPT}"
 else
     echo "=== 1/4 Skip tests (--no-test) ==="
 fi

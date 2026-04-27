@@ -8,6 +8,7 @@ package raft
 import (
 	//	"bytes"
 	"bytes"
+	"encoding/binary"
 	"encoding/gob"
 	"math/rand"
 	"net/rpc"
@@ -28,7 +29,11 @@ type Persister interface {
 	ReadRaftState() []byte
 	ReadHardState() []byte
 	ReadSnapshot() []byte
+	EnqueueSave(raftstate []byte, snapshot []byte) <-chan error
+	EnqueueAppendRaftState(data []byte) <-chan error
+	EnqueueSaveHardState(hardstate []byte) <-chan error
 	Save(raftstate []byte, snapshot []byte)
+	AppendRaftState(data []byte)
 	SaveHardState(hardstate []byte)
 	RaftStateSize() int
 }
@@ -42,6 +47,9 @@ const (
 type LogEntry struct {
 	Term    int
 	Command interface{}
+	// commandBytes caches gob-encoded command payload for persistence.
+	// It is intentionally unexported, so RPC replication does not transmit it.
+	commandBytes []byte
 }
 
 type persistentState struct {
@@ -55,6 +63,47 @@ type persistentState struct {
 type hardState struct {
 	CurrentTerm int
 	VotedFor    int
+}
+
+type RaftPerfStats struct {
+	MuWaitCount         int64
+	MuWaitNanos         int64
+	MuWaitAvgNanos      float64
+	PersistWaitCount    int64
+	PersistWaitNanos    int64
+	PersistWaitAvgNanos float64
+}
+
+const persistFormatV2Magic = -20260420
+
+const (
+	persistFormatV3Magic uint32 = 0x4b565233 // "KVR3"
+	persistV3HeaderSize         = 44
+
+	persistV3OffMagic            = 0
+	persistV3OffCurrentTerm      = 4
+	persistV3OffVotedFor         = 12
+	persistV3OffLastIncludedIdx  = 20
+	persistV3OffLastIncludedTerm = 28
+	persistV3OffLogCount         = 36
+
+	persistV3AppendPayloadMagic uint32 = 0x52504131 // "RPA1"
+	persistV3AppendPayloadSize         = 28
+
+	persistV3AppendOffMagic     = 0
+	persistV3AppendOffPrevLen   = 4
+	persistV3AppendOffNewLen    = 12
+	persistV3AppendOffHeaderLen = 20
+	persistV3AppendOffDeltaLen  = 24
+)
+
+type persistedLogEntry struct {
+	Term        int
+	CommandData []byte
+}
+
+type persistedCommandEnvelope struct {
+	Value interface{}
 }
 
 // 实现单个 Raft 节点的 Go 对象。
@@ -99,6 +148,23 @@ type Raft struct {
 	// RPC 客户端连接缓存
 	rpcMu      sync.Mutex
 	rpcClients map[string]*rpc.Client
+
+	// 增量持久化缓存（V3）：state = header + encoded log entries。
+	persistV3State     []byte
+	persistV3EntryEnd  []int
+	persistV3LogCount  int
+	persistV3DirtyFrom int
+	persistV3Ready     bool
+
+	persistV3PersistedLen      int
+	persistV3PersistedLogCount int
+	persistV3QueuedLen         int
+	persistV3QueuedLogCount    int
+
+	muWaitNanos      int64
+	muWaitCount      int64
+	persistWaitNanos int64
+	persistWaitCount int64
 }
 
 // callPeer 通过 RPC 调用远程 Raft 节点
@@ -153,6 +219,47 @@ func (rf *Raft) GetState() (int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	return rf.CurrentTerm, rf.state == Leader
+}
+
+func (rf *Raft) lockWithMetrics() {
+	started := time.Now()
+	rf.mu.Lock()
+	atomic.AddInt64(&rf.muWaitNanos, time.Since(started).Nanoseconds())
+	atomic.AddInt64(&rf.muWaitCount, 1)
+}
+
+func (rf *Raft) waitPersistDone(done <-chan error) error {
+	if done == nil {
+		return nil
+	}
+	started := time.Now()
+	err := <-done
+	atomic.AddInt64(&rf.persistWaitNanos, time.Since(started).Nanoseconds())
+	atomic.AddInt64(&rf.persistWaitCount, 1)
+	return err
+}
+
+func (rf *Raft) PerfStatsSnapshot() RaftPerfStats {
+	muWaitCount := atomic.LoadInt64(&rf.muWaitCount)
+	muWaitNanos := atomic.LoadInt64(&rf.muWaitNanos)
+	persistWaitCount := atomic.LoadInt64(&rf.persistWaitCount)
+	persistWaitNanos := atomic.LoadInt64(&rf.persistWaitNanos)
+
+	avg := func(total int64, count int64) float64 {
+		if count <= 0 {
+			return 0
+		}
+		return float64(total) / float64(count)
+	}
+
+	return RaftPerfStats{
+		MuWaitCount:         muWaitCount,
+		MuWaitNanos:         muWaitNanos,
+		MuWaitAvgNanos:      avg(muWaitNanos, muWaitCount),
+		PersistWaitCount:    persistWaitCount,
+		PersistWaitNanos:    persistWaitNanos,
+		PersistWaitAvgNanos: avg(persistWaitNanos, persistWaitCount),
+	}
 }
 
 func (rf *Raft) setStateLocked(state int) {
@@ -263,9 +370,243 @@ func (rf *Raft) getTerm(index int) int {
 	return rf.log[index-rf.lastIncludedIndex].Term
 }
 
-// 将 Raft 的持久状态保存到稳定存储中，
-// 以便在崩溃并重启后能够恢复。
-func (rf *Raft) persist(snapshot []byte) {
+func makePersistV3Header() []byte {
+	buf := make([]byte, persistV3HeaderSize)
+	binary.LittleEndian.PutUint32(buf[persistV3OffMagic:persistV3OffMagic+4], persistFormatV3Magic)
+	return buf
+}
+
+func putPersistV3HeaderFields(buf []byte, currentTerm, votedFor, lastIncludedIndex, lastIncludedTerm, logCount int) bool {
+	if len(buf) < persistV3HeaderSize {
+		return false
+	}
+	binary.LittleEndian.PutUint32(buf[persistV3OffMagic:persistV3OffMagic+4], persistFormatV3Magic)
+	binary.LittleEndian.PutUint64(buf[persistV3OffCurrentTerm:persistV3OffCurrentTerm+8], uint64(int64(currentTerm)))
+	binary.LittleEndian.PutUint64(buf[persistV3OffVotedFor:persistV3OffVotedFor+8], uint64(int64(votedFor)))
+	binary.LittleEndian.PutUint64(buf[persistV3OffLastIncludedIdx:persistV3OffLastIncludedIdx+8], uint64(int64(lastIncludedIndex)))
+	binary.LittleEndian.PutUint64(buf[persistV3OffLastIncludedTerm:persistV3OffLastIncludedTerm+8], uint64(int64(lastIncludedTerm)))
+	binary.LittleEndian.PutUint64(buf[persistV3OffLogCount:persistV3OffLogCount+8], uint64(int64(logCount)))
+	return true
+}
+
+func appendInt64LE(dst []byte, v int64) []byte {
+	var b [8]byte
+	binary.LittleEndian.PutUint64(b[:], uint64(v))
+	return append(dst, b[:]...)
+}
+
+func readInt64LE(src []byte, offset *int) (int64, bool) {
+	if offset == nil || *offset < 0 || *offset+8 > len(src) {
+		return 0, false
+	}
+	v := int64(binary.LittleEndian.Uint64(src[*offset : *offset+8]))
+	*offset += 8
+	return v, true
+}
+
+func (rf *Raft) initPersistV3CacheLocked() {
+	rf.persistV3State = makePersistV3Header()
+	rf.persistV3EntryEnd = rf.persistV3EntryEnd[:0]
+	rf.persistV3LogCount = 0
+	rf.persistV3DirtyFrom = 0
+	rf.persistV3Ready = true
+}
+
+func (rf *Raft) invalidatePersistV3CacheLocked() {
+	rf.persistV3State = nil
+	rf.persistV3EntryEnd = nil
+	rf.persistV3LogCount = 0
+	rf.persistV3DirtyFrom = 0
+	rf.persistV3Ready = false
+	rf.persistV3PersistedLen = 0
+	rf.persistV3PersistedLogCount = 0
+	rf.persistV3QueuedLen = 0
+	rf.persistV3QueuedLogCount = 0
+}
+
+func canUsePersistV3Append(state []byte, prevLen int) bool {
+	if prevLen < persistV3HeaderSize {
+		return false
+	}
+	if len(state) < prevLen {
+		return false
+	}
+	return len(state) >= persistV3HeaderSize
+}
+
+func buildPersistV3AppendPayload(state []byte, prevLen int) ([]byte, bool) {
+	if !canUsePersistV3Append(state, prevLen) {
+		return nil, false
+	}
+
+	delta := state[prevLen:]
+	deltaLen := len(delta)
+	payloadLen := persistV3AppendPayloadSize + persistV3HeaderSize + deltaLen
+	payload := make([]byte, payloadLen)
+
+	binary.LittleEndian.PutUint32(payload[persistV3AppendOffMagic:persistV3AppendOffMagic+4], persistV3AppendPayloadMagic)
+	binary.LittleEndian.PutUint64(payload[persistV3AppendOffPrevLen:persistV3AppendOffPrevLen+8], uint64(prevLen))
+	binary.LittleEndian.PutUint64(payload[persistV3AppendOffNewLen:persistV3AppendOffNewLen+8], uint64(len(state)))
+	binary.LittleEndian.PutUint32(payload[persistV3AppendOffHeaderLen:persistV3AppendOffHeaderLen+4], uint32(persistV3HeaderSize))
+	binary.LittleEndian.PutUint32(payload[persistV3AppendOffDeltaLen:persistV3AppendOffDeltaLen+4], uint32(deltaLen))
+
+	copy(payload[persistV3AppendPayloadSize:persistV3AppendPayloadSize+persistV3HeaderSize], state[:persistV3HeaderSize])
+	copy(payload[persistV3AppendPayloadSize+persistV3HeaderSize:], delta)
+	return payload, true
+}
+
+func (rf *Raft) canPersistV3AppendLocked(snapshot []byte, state []byte, dirtyFromBefore int) bool {
+	if snapshot != nil {
+		return false
+	}
+	if !rf.persistV3Ready {
+		return false
+	}
+	if rf.persistV3QueuedLogCount > len(rf.log) {
+		return false
+	}
+	if dirtyFromBefore < rf.persistV3QueuedLogCount {
+		return false
+	}
+	return canUsePersistV3Append(state, rf.persistV3QueuedLen)
+}
+
+func (rf *Raft) markPersistV3PersistedLocked(stateLen int, logCount int) {
+	if stateLen < 0 {
+		stateLen = 0
+	}
+	if logCount < 0 {
+		logCount = 0
+	}
+	rf.persistV3PersistedLen = stateLen
+	rf.persistV3PersistedLogCount = logCount
+}
+
+func (rf *Raft) markPersistV3QueuedLocked(stateLen int, logCount int) {
+	if stateLen < 0 {
+		stateLen = 0
+	}
+	if logCount < 0 {
+		logCount = 0
+	}
+	rf.persistV3QueuedLen = stateLen
+	rf.persistV3QueuedLogCount = logCount
+}
+
+func (rf *Raft) markPersistV3DirtyFromLocked(pos int) {
+	if !rf.persistV3Ready {
+		return
+	}
+	if pos < 0 {
+		pos = 0
+	}
+	if pos > len(rf.log) {
+		pos = len(rf.log)
+	}
+	if rf.persistV3DirtyFrom > pos {
+		rf.persistV3DirtyFrom = pos
+	}
+}
+
+func (rf *Raft) truncatePersistV3ToLocked(keep int) bool {
+	if !rf.persistV3Ready {
+		return false
+	}
+	if keep < 0 {
+		keep = 0
+	}
+	if keep == 0 {
+		rf.persistV3State = rf.persistV3State[:persistV3HeaderSize]
+		rf.persistV3EntryEnd = rf.persistV3EntryEnd[:0]
+		rf.persistV3LogCount = 0
+		return true
+	}
+	if keep > len(rf.persistV3EntryEnd) {
+		return false
+	}
+	end := rf.persistV3EntryEnd[keep-1]
+	if end < persistV3HeaderSize || end > len(rf.persistV3State) {
+		return false
+	}
+	rf.persistV3State = rf.persistV3State[:end]
+	rf.persistV3EntryEnd = rf.persistV3EntryEnd[:keep]
+	rf.persistV3LogCount = keep
+	return true
+}
+
+func (rf *Raft) appendPersistV3EntryLocked(entry *LogEntry) bool {
+	if entry == nil {
+		return false
+	}
+	if !ensureEntryCommandEncoded(entry) {
+		return false
+	}
+	rf.persistV3State = appendInt64LE(rf.persistV3State, int64(entry.Term))
+	rf.persistV3State = appendInt64LE(rf.persistV3State, int64(len(entry.commandBytes)))
+	rf.persistV3State = append(rf.persistV3State, entry.commandBytes...)
+	rf.persistV3EntryEnd = append(rf.persistV3EntryEnd, len(rf.persistV3State))
+	rf.persistV3LogCount++
+	return true
+}
+
+func (rf *Raft) encodePersistentStateIncrementalLocked() ([]byte, bool) {
+	if !rf.persistV3Ready {
+		rf.initPersistV3CacheLocked()
+	}
+
+	if rf.persistV3DirtyFrom > len(rf.log) {
+		rf.persistV3DirtyFrom = len(rf.log)
+	}
+
+	if rf.persistV3LogCount > len(rf.log) {
+		if !rf.truncatePersistV3ToLocked(len(rf.log)) {
+			rf.initPersistV3CacheLocked()
+		}
+	}
+
+	if rf.persistV3DirtyFrom < rf.persistV3LogCount {
+		if !rf.truncatePersistV3ToLocked(rf.persistV3DirtyFrom) {
+			rf.initPersistV3CacheLocked()
+		}
+	}
+
+	for rf.persistV3LogCount < len(rf.log) {
+		idx := rf.persistV3LogCount
+		if !rf.appendPersistV3EntryLocked(&rf.log[idx]) {
+			return nil, false
+		}
+	}
+
+	if !putPersistV3HeaderFields(
+		rf.persistV3State,
+		rf.CurrentTerm,
+		rf.VotedFor,
+		rf.lastIncludedIndex,
+		rf.lastIncludedTerm,
+		len(rf.log),
+	) {
+		return nil, false
+	}
+
+	rf.persistV3DirtyFrom = len(rf.log)
+	return rf.persistV3State, true
+}
+
+func (rf *Raft) enqueuePersistLocked(snapshot []byte) (<-chan error, int, int) {
+	dirtyFromBefore := rf.persistV3DirtyFrom
+	if state, ok := rf.encodePersistentStateIncrementalLocked(); ok {
+		logCount := len(rf.log)
+		stateLen := len(state)
+		if rf.canPersistV3AppendLocked(snapshot, state, dirtyFromBefore) {
+			if payload, payloadOK := buildPersistV3AppendPayload(state, rf.persistV3QueuedLen); payloadOK {
+				rf.markPersistV3QueuedLocked(stateLen, logCount)
+				return rf.persister.EnqueueAppendRaftState(payload), stateLen, logCount
+			}
+		}
+		rf.markPersistV3QueuedLocked(stateLen, logCount)
+		return rf.persister.EnqueueSave(state, snapshot), stateLen, logCount
+	}
+
 	state := persistentState{
 		CurrentTerm:       rf.CurrentTerm,
 		VotedFor:          rf.VotedFor,
@@ -273,15 +614,188 @@ func (rf *Raft) persist(snapshot []byte) {
 		LastIncludedIndex: rf.lastIncludedIndex,
 		LastIncludedTerm:  rf.lastIncludedTerm,
 	}
-	rf.persister.Save(encodePersistentState(state), snapshot)
+	rf.invalidatePersistV3CacheLocked()
+	return rf.persister.EnqueueSave(encodePersistentState(state), snapshot), -1, -1
+}
+
+func (rf *Raft) commitPersistResult(stateLen int, logCount int, err error) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if err != nil {
+		rf.invalidatePersistV3CacheLocked()
+		return
+	}
+	if stateLen >= 0 {
+		rf.markPersistV3PersistedLocked(stateLen, logCount)
+	}
+}
+
+func (rf *Raft) enqueuePersistHardStateLocked() <-chan error {
+	return rf.persister.EnqueueSaveHardState(encodeHardState(rf.CurrentTerm, rf.VotedFor))
+}
+
+// 将 Raft 的持久状态保存到稳定存储中，
+// 以便在崩溃并重启后能够恢复。
+func (rf *Raft) persist(snapshot []byte) {
+	done, stateLen, logCount := rf.enqueuePersistLocked(snapshot)
+	err := rf.waitPersistDone(done)
+	if err != nil {
+		rf.invalidatePersistV3CacheLocked()
+		return
+	}
+	if stateLen >= 0 {
+		rf.markPersistV3PersistedLocked(stateLen, logCount)
+	}
 }
 
 func (rf *Raft) persistHardState() {
-	rf.persister.SaveHardState(encodeHardState(rf.CurrentTerm, rf.VotedFor))
+	err := rf.waitPersistDone(rf.enqueuePersistHardStateLocked())
+	if err != nil {
+		rf.invalidatePersistV3CacheLocked()
+	}
 }
 
 // 恢复先前持久化的状态。
 func (rf *Raft) readPersist(data []byte) {
+	if rf.readPersistV3(data) {
+		return
+	}
+	if rf.readPersistV2(data) {
+		rf.invalidatePersistV3CacheLocked()
+		return
+	}
+	rf.readPersistLegacy(data)
+	rf.invalidatePersistV3CacheLocked()
+}
+
+func (rf *Raft) readPersistV3(data []byte) bool {
+	if data == nil || len(data) < persistV3HeaderSize {
+		return false
+	}
+
+	if binary.LittleEndian.Uint32(data[persistV3OffMagic:persistV3OffMagic+4]) != persistFormatV3Magic {
+		return false
+	}
+
+	currentTerm := int(int64(binary.LittleEndian.Uint64(data[persistV3OffCurrentTerm : persistV3OffCurrentTerm+8])))
+	votedFor := int(int64(binary.LittleEndian.Uint64(data[persistV3OffVotedFor : persistV3OffVotedFor+8])))
+	lastIncludedIndex := int(int64(binary.LittleEndian.Uint64(data[persistV3OffLastIncludedIdx : persistV3OffLastIncludedIdx+8])))
+	lastIncludedTerm := int(int64(binary.LittleEndian.Uint64(data[persistV3OffLastIncludedTerm : persistV3OffLastIncludedTerm+8])))
+	logCount64 := int64(binary.LittleEndian.Uint64(data[persistV3OffLogCount : persistV3OffLogCount+8]))
+	if logCount64 < 0 {
+		return false
+	}
+
+	logCount := int(logCount64)
+	decodedLog := make([]LogEntry, 0, logCount)
+	entryEnds := make([]int, 0, logCount)
+
+	offset := persistV3HeaderSize
+	for i := 0; i < logCount; i++ {
+		term64, ok := readInt64LE(data, &offset)
+		if !ok {
+			return false
+		}
+		cmdLen64, ok := readInt64LE(data, &offset)
+		if !ok || cmdLen64 < 0 || cmdLen64 > int64(len(data)-offset) {
+			return false
+		}
+		cmdLen := int(cmdLen64)
+		cmdData := append([]byte(nil), data[offset:offset+cmdLen]...)
+		offset += cmdLen
+
+		cmd, ok := decodeCommandFromBytes(cmdData)
+		if !ok {
+			return false
+		}
+		decodedLog = append(decodedLog, LogEntry{
+			Term:         int(term64),
+			Command:      cmd,
+			commandBytes: cmdData,
+		})
+		entryEnds = append(entryEnds, offset)
+	}
+
+	if offset != len(data) {
+		return false
+	}
+
+	if len(decodedLog) == 0 {
+		decodedLog = []LogEntry{{Term: lastIncludedTerm}}
+		rf.invalidatePersistV3CacheLocked()
+	} else {
+		rf.persistV3State = append([]byte(nil), data...)
+		rf.persistV3EntryEnd = append([]int(nil), entryEnds...)
+		rf.persistV3LogCount = len(decodedLog)
+		rf.persistV3DirtyFrom = len(decodedLog)
+		rf.persistV3Ready = true
+		rf.persistV3PersistedLen = len(data)
+		rf.persistV3PersistedLogCount = len(decodedLog)
+		rf.persistV3QueuedLen = len(data)
+		rf.persistV3QueuedLogCount = len(decodedLog)
+	}
+
+	rf.CurrentTerm = currentTerm
+	rf.VotedFor = votedFor
+	rf.log = decodedLog
+	rf.lastIncludedIndex = lastIncludedIndex
+	rf.lastIncludedTerm = lastIncludedTerm
+	return true
+}
+
+func (rf *Raft) readPersistV2(data []byte) bool {
+	if data == nil || len(data) < 1 { // 没有任何状态时启动
+		return false
+	}
+
+	r := bytes.NewBuffer(data)
+	d := gob.NewDecoder(r)
+
+	var magic int
+	if d.Decode(&magic) != nil || magic != persistFormatV2Magic {
+		return false
+	}
+
+	var currentTerm int
+	var votedFor int
+	var log []persistedLogEntry
+	var lastIncludedIndex int
+	var lastIncludedTerm int
+
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&log) != nil ||
+		d.Decode(&lastIncludedIndex) != nil ||
+		d.Decode(&lastIncludedTerm) != nil {
+		return false
+	}
+
+	decodedLog := make([]LogEntry, len(log))
+	for i := range log {
+		cmd, ok := decodeCommandFromBytes(log[i].CommandData)
+		if !ok {
+			return false
+		}
+		decodedLog[i] = LogEntry{
+			Term:         log[i].Term,
+			Command:      cmd,
+			commandBytes: append([]byte(nil), log[i].CommandData...),
+		}
+	}
+
+	if len(decodedLog) == 0 {
+		decodedLog = []LogEntry{{Term: lastIncludedTerm}}
+	}
+
+	rf.CurrentTerm = currentTerm
+	rf.VotedFor = votedFor
+	rf.log = decodedLog
+	rf.lastIncludedIndex = lastIncludedIndex
+	rf.lastIncludedTerm = lastIncludedTerm
+	return true
+}
+
+func (rf *Raft) readPersistLegacy(data []byte) {
 	if data == nil || len(data) < 1 { // 没有任何状态时启动
 		return
 	}
@@ -295,13 +809,16 @@ func (rf *Raft) readPersist(data []byte) {
 	var lastIncludedIndex int
 	var lastIncludedTerm int
 
-	// 必须检查所有解码错误
 	if d.Decode(&currentTerm) != nil ||
 		d.Decode(&votedFor) != nil ||
 		d.Decode(&log) != nil ||
 		d.Decode(&lastIncludedIndex) != nil ||
 		d.Decode(&lastIncludedTerm) != nil {
-		return // 解码失败，保持初始值
+		return
+	}
+
+	if len(log) == 0 {
+		log = []LogEntry{{Term: lastIncludedTerm}}
 	}
 
 	rf.CurrentTerm = currentTerm
@@ -337,7 +854,47 @@ func (rf *Raft) PersistBytes() int {
 	return rf.persister.RaftStateSize()
 }
 
-func encodePersistentState(s persistentState) []byte {
+func encodeCommandToBytes(command interface{}) ([]byte, bool) {
+	if command == nil {
+		return nil, true
+	}
+	buf := new(bytes.Buffer)
+	enc := gob.NewEncoder(buf)
+	if err := enc.Encode(persistedCommandEnvelope{Value: command}); err != nil {
+		return nil, false
+	}
+	return buf.Bytes(), true
+}
+
+func decodeCommandFromBytes(data []byte) (interface{}, bool) {
+	if len(data) == 0 {
+		return nil, true
+	}
+	buf := bytes.NewBuffer(data)
+	dec := gob.NewDecoder(buf)
+	var envelope persistedCommandEnvelope
+	if err := dec.Decode(&envelope); err != nil {
+		return nil, false
+	}
+	return envelope.Value, true
+}
+
+func ensureEntryCommandEncoded(entry *LogEntry) bool {
+	if entry == nil {
+		return false
+	}
+	if len(entry.commandBytes) > 0 || entry.Command == nil {
+		return true
+	}
+	encoded, ok := encodeCommandToBytes(entry.Command)
+	if !ok {
+		return false
+	}
+	entry.commandBytes = encoded
+	return true
+}
+
+func encodePersistentStateLegacy(s persistentState) []byte {
 	buf := new(bytes.Buffer)
 	enc := gob.NewEncoder(buf)
 
@@ -347,7 +904,32 @@ func encodePersistentState(s persistentState) []byte {
 	_ = enc.Encode(s.LastIncludedIndex)
 	_ = enc.Encode(s.LastIncludedTerm)
 
-	return append([]byte(nil), buf.Bytes()...)
+	return buf.Bytes()
+}
+
+func encodePersistentState(s persistentState) []byte {
+	persistedLog := make([]persistedLogEntry, len(s.Log))
+	for i := range s.Log {
+		if !ensureEntryCommandEncoded(&s.Log[i]) {
+			return encodePersistentStateLegacy(s)
+		}
+		persistedLog[i] = persistedLogEntry{
+			Term:        s.Log[i].Term,
+			CommandData: s.Log[i].commandBytes,
+		}
+	}
+
+	buf := new(bytes.Buffer)
+	enc := gob.NewEncoder(buf)
+
+	_ = enc.Encode(persistFormatV2Magic)
+	_ = enc.Encode(s.CurrentTerm)
+	_ = enc.Encode(s.VotedFor)
+	_ = enc.Encode(persistedLog)
+	_ = enc.Encode(s.LastIncludedIndex)
+	_ = enc.Encode(s.LastIncludedTerm)
+
+	return buf.Bytes()
 }
 
 func encodeHardState(currentTerm, votedFor int) []byte {
@@ -357,7 +939,7 @@ func encodeHardState(currentTerm, votedFor int) []byte {
 	_ = enc.Encode(currentTerm)
 	_ = enc.Encode(votedFor)
 
-	return append([]byte(nil), buf.Bytes()...)
+	return buf.Bytes()
 }
 
 // 服务端通知 Raft：它已创建了一个包含
@@ -395,6 +977,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	}
 
 	rf.log = newLogs
+	rf.markPersistV3DirtyFromLocked(0)
 
 	// 5. 更新 snapshot 元数据
 	rf.lastIncludedIndex = index
@@ -425,12 +1008,13 @@ type RequestVoteReply struct {
 
 // RequestVote RPC 处理函数
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) error {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	rf.lockWithMetrics()
+	persistNeeded := false
 
 	if args.Term < rf.CurrentTerm {
 		reply.Term = rf.CurrentTerm
 		reply.VoteGranted = false
+		rf.mu.Unlock()
 		return nil
 	}
 
@@ -438,19 +1022,28 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) erro
 		rf.CurrentTerm = args.Term
 		rf.setStateLocked(Follower)
 		rf.VotedFor = -1
-		rf.persistHardState()
+		persistNeeded = true
 	}
 
 	if args.LastLogTerm < rf.getLastLogTerm() ||
 		(args.LastLogTerm == rf.getLastLogTerm() && args.LastLogIndex < rf.getLastLogIndex()) {
+		reply.Term = rf.CurrentTerm
 		reply.VoteGranted = false
+		var persistDone <-chan error
+		if persistNeeded {
+			persistDone = rf.enqueuePersistHardStateLocked()
+		}
+		rf.mu.Unlock()
+		if err := rf.waitPersistDone(persistDone); err != nil {
+			rf.commitPersistResult(-1, -1, err)
+		}
 		return nil
 	}
 
 	if rf.VotedFor == -1 || rf.VotedFor == args.CandidateId {
 		reply.VoteGranted = true
 		rf.VotedFor = args.CandidateId
-		rf.persistHardState()
+		persistNeeded = true
 	} else {
 		reply.VoteGranted = false
 	}
@@ -458,6 +1051,15 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) erro
 	reply.Term = rf.CurrentTerm
 	if reply.VoteGranted {
 		rf.resetElectionTimer()
+	}
+
+	var persistDone <-chan error
+	if persistNeeded {
+		persistDone = rf.enqueuePersistHardStateLocked()
+	}
+	rf.mu.Unlock()
+	if err := rf.waitPersistDone(persistDone); err != nil {
+		rf.commitPersistResult(-1, -1, err)
 	}
 	return nil
 }
@@ -488,20 +1090,34 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) error {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	rf.lockWithMetrics()
+	hardPersistNeeded := false
+	persistStateLen := -1
+	persistLogCount := -1
+	var persistDone <-chan error
+	finalize := func() error {
+		if persistDone == nil && hardPersistNeeded {
+			persistDone = rf.enqueuePersistHardStateLocked()
+		}
+		rf.mu.Unlock()
+		err := rf.waitPersistDone(persistDone)
+		if persistStateLen >= 0 || err != nil {
+			rf.commitPersistResult(persistStateLen, persistLogCount, err)
+		}
+		return nil
+	}
 	// ---（第 1 步）任期检查：拒绝过期 leader---
 	if args.Term < rf.CurrentTerm {
 		reply.Term = rf.CurrentTerm
 		reply.Success = false
-		return nil
+		return finalize()
 	}
 	// ---（第 2 步）如果 leader 的 term 更大，更新自己的 term 并转为 follower---
 	if args.Term >= rf.CurrentTerm {
 		if args.Term > rf.CurrentTerm {
 			rf.CurrentTerm = args.Term
 			rf.VotedFor = -1
-			rf.persistHardState()
+			hardPersistNeeded = true
 		}
 		rf.setStateLocked(Follower)
 	}
@@ -516,7 +1132,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = false
 		reply.ConflictTerm = -1
 		reply.ConflictIndex = rf.getLastLogIndex() + 1
-		return nil
+		return finalize()
 	}
 
 	// ---（第 5 步）检查 prevLogTerm 是否匹配---
@@ -524,7 +1140,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = false
 		reply.ConflictTerm = -1
 		reply.ConflictIndex = rf.lastIncludedIndex + 1
-		return nil
+		return finalize()
 	}
 
 	if rf.getTerm(args.PrevLogIndex) != args.PrevLogTerm {
@@ -539,11 +1155,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 
 		reply.ConflictIndex = index
-		return nil
+		return finalize()
 	}
 
 	// ---（第 6 步）删除冲突日志（同 index 不同 term）---
 	// 从第一个冲突点开始删除
+	persistNeeded := false
 	i := 0
 	for ; i < len(args.Entries); i++ {
 		index := args.PrevLogIndex + 1 + i
@@ -558,8 +1175,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			if cut < 1 {
 				cut = 1
 			}
-			rf.log = rf.log[:cut]
-			rf.persist(nil)
+			if cut < len(rf.log) {
+				rf.markPersistV3DirtyFromLocked(cut)
+				rf.log = rf.log[:cut]
+				persistNeeded = true
+			}
 			break
 		}
 	}
@@ -567,8 +1187,22 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// ---（第 7 步）追加 leader 发来的新日志---
 	// 注意：只追加 follower 没有的部分
 	if i < len(args.Entries) {
-		rf.log = append(rf.log, args.Entries[i:]...)
-		rf.persist(nil)
+		appendFrom := len(rf.log)
+		rf.markPersistV3DirtyFromLocked(appendFrom)
+		newEntries := make([]LogEntry, len(args.Entries)-i)
+		for j := i; j < len(args.Entries); j++ {
+			entry := args.Entries[j]
+			_ = ensureEntryCommandEncoded(&entry)
+			newEntries[j-i] = entry
+		}
+		rf.log = append(rf.log, newEntries...)
+		persistNeeded = true
+	}
+
+	if persistNeeded {
+		persistDone, persistStateLen, persistLogCount = rf.enqueuePersistLocked(nil)
+	} else if hardPersistNeeded {
+		persistDone = rf.enqueuePersistHardStateLocked()
 	}
 
 	// // ---（第 8 步）更新 CommitIndex ---
@@ -580,7 +1214,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	reply.Success = true
-	return nil
+	return finalize()
 }
 
 // 向某个服务器发送 RequestVote RPC 的示例
@@ -601,12 +1235,13 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // 第二个返回值是当前任期。
 // 第三个返回值表示该服务器是否认为自己是领导者。
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	rf.lockWithMetrics()
 
 	// 1. 如果不是 Leader，直接拒绝
 	if rf.state != Leader {
-		return -1, rf.CurrentTerm, false
+		term := rf.CurrentTerm
+		rf.mu.Unlock()
+		return -1, term, false
 	}
 
 	// 2. 计算新日志的 index
@@ -614,11 +1249,19 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term := rf.CurrentTerm
 
 	// 3. 追加日志（这是 Start 的核心）
-	rf.log = append(rf.log, LogEntry{
+	entry := LogEntry{
 		Term:    term,
 		Command: command,
-	})
-	rf.persist(nil)
+	}
+	rf.markPersistV3DirtyFromLocked(len(rf.log))
+	_ = ensureEntryCommandEncoded(&entry)
+	rf.log = append(rf.log, entry)
+	persistDone, persistStateLen, persistLogCount := rf.enqueuePersistLocked(nil)
+	rf.mu.Unlock()
+
+	err := rf.waitPersistDone(persistDone)
+	rf.commitPersistResult(persistStateLen, persistLogCount, err)
+
 	// 新日志到达时触发一次快速复制，避免每次 Start 都创建复制 goroutine。
 	select {
 	case rf.replicateTrigger <- struct{}{}:
@@ -699,6 +1342,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		// 快照覆盖的日志不存在或不一致，直接用快照
 		rf.log = []LogEntry{{Term: args.LastIncludedTerm}}
 	}
+	rf.markPersistV3DirtyFromLocked(0)
 	// 更新快照元数据
 	rf.lastIncludedIndex = args.LastIncludedIndex
 	rf.lastIncludedTerm = args.LastIncludedTerm

@@ -51,6 +51,14 @@ const (
 	defaultPutTimeoutMs    = 1200
 	defaultDeleteTimeoutMs = 1200
 	defaultScanTimeoutMs   = 1200
+
+	shardedRetryWindow          = 10 * time.Second
+	shardedRetryBackoff         = 15 * time.Millisecond
+	shardedMaxAttempts          = 80
+	shardedGetAttemptTimeout    = 350 * time.Millisecond
+	shardedPutAttemptTimeout    = 450 * time.Millisecond
+	shardedDeleteAttemptTimeout = 450 * time.Millisecond
+	shardedScanAttemptTimeout   = 450 * time.Millisecond
 )
 
 // WatchSubscription 表示一个可取消的 Watch 订阅。
@@ -260,20 +268,35 @@ func mapPBErr(errText string) kvraftapi.Err {
 // 参数的声明类型相匹配。此外，reply 必须作为指针传递。
 func (ck *Clerk) Get(key string) (string, kvraftapi.Tversion, int64, kvraftapi.Err) {
 	if ck.router != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		resp, err := ck.router.GetRoute(ctx, key)
-		if err != nil || resp == nil {
-			return "", 0, 0, kvraftapi.ErrWrongLeader
+		deadline := time.Now().Add(shardedRetryWindow)
+		attempts := 0
+		for {
+			if attempts >= shardedMaxAttempts || time.Now().After(deadline) {
+				return "", 0, 0, kvraftapi.ErrWrongLeader
+			}
+
+			attemptCtx, cancel := context.WithDeadline(context.Background(), deadline)
+			attemptCtx, cancel2 := context.WithTimeout(attemptCtx, shardedGetAttemptTimeout)
+			resp, err := ck.router.GetRoute(attemptCtx, key)
+			cancel2()
+			cancel()
+			attempts++
+
+			if err != nil || resp == nil {
+				time.Sleep(shardedRetryBackoff)
+				continue
+			}
+
+			errCode := mapPBErr(resp.GetError())
+			switch errCode {
+			case kvraftapi.OK:
+				return resp.GetValue(), kvraftapi.Tversion(resp.GetVersion()), resp.GetExpires(), kvraftapi.OK
+			case kvraftapi.ErrNoKey:
+				return "", 0, 0, kvraftapi.ErrNoKey
+			default:
+				time.Sleep(shardedRetryBackoff)
+			}
 		}
-		errCode := mapPBErr(resp.GetError())
-		if errCode == kvraftapi.OK {
-			return resp.GetValue(), kvraftapi.Tversion(resp.GetVersion()), resp.GetExpires(), kvraftapi.OK
-		}
-		if errCode == kvraftapi.ErrNoKey {
-			return "", 0, 0, kvraftapi.ErrNoKey
-		}
-		return "", 0, 0, errCode
 	}
 
 	// 不是分片模式或分片路由未启用，进入传统模式
@@ -354,13 +377,42 @@ func (ck *Clerk) Get(key string) (string, kvraftapi.Tversion, int64, kvraftapi.E
 // 参数的声明类型相匹配。此外，reply 必须作为指针传递。
 func (ck *Clerk) Put(key string, value string, version kvraftapi.Tversion) kvraftapi.Err {
 	if ck.router != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		resp, err := ck.router.PutRoute(ctx, key, value, int64(version))
-		if err != nil || resp == nil {
-			return kvraftapi.ErrWrongLeader
+		deadline := time.Now().Add(shardedRetryWindow)
+		attempts := 0
+		retried := false
+
+		for {
+			if attempts >= shardedMaxAttempts || time.Now().After(deadline) {
+				return kvraftapi.ErrWrongLeader
+			}
+
+			attemptCtx, cancel := context.WithDeadline(context.Background(), deadline)
+			attemptCtx, cancel2 := context.WithTimeout(attemptCtx, shardedPutAttemptTimeout)
+			resp, err := ck.router.PutRoute(attemptCtx, key, value, int64(version))
+			cancel2()
+			cancel()
+			attempts++
+
+			if err != nil || resp == nil {
+				retried = true
+				time.Sleep(shardedRetryBackoff)
+				continue
+			}
+
+			errCode := mapPBErr(resp.GetError())
+			switch errCode {
+			case kvraftapi.OK, kvraftapi.ErrNoKey:
+				return errCode
+			case kvraftapi.ErrVersion:
+				if retried {
+					return kvraftapi.ErrMaybe
+				}
+				return kvraftapi.ErrVersion
+			default:
+				retried = true
+				time.Sleep(shardedRetryBackoff)
+			}
 		}
-		return mapPBErr(resp.GetError())
 	}
 
 	args := kvraftapi.PutArgs{Key: key, Value: value, Version: version}
@@ -434,13 +486,42 @@ func (ck *Clerk) Put(key string, value string, version kvraftapi.Tversion) kvraf
 // PutWithTTL 修改一个键值对，带有TTL支持
 func (ck *Clerk) PutWithTTL(key string, value string, version kvraftapi.Tversion, ttlSeconds int64) kvraftapi.Err {
 	if ck.router != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		resp, err := ck.router.PutRouteWithTTL(ctx, key, value, int64(version), ttlSeconds)
-		if err != nil || resp == nil {
-			return kvraftapi.ErrWrongLeader
+		deadline := time.Now().Add(shardedRetryWindow)
+		attempts := 0
+		retried := false
+
+		for {
+			if attempts >= shardedMaxAttempts || time.Now().After(deadline) {
+				return kvraftapi.ErrWrongLeader
+			}
+
+			attemptCtx, cancel := context.WithDeadline(context.Background(), deadline)
+			attemptCtx, cancel2 := context.WithTimeout(attemptCtx, shardedPutAttemptTimeout)
+			resp, err := ck.router.PutRouteWithTTL(attemptCtx, key, value, int64(version), ttlSeconds)
+			cancel2()
+			cancel()
+			attempts++
+
+			if err != nil || resp == nil {
+				retried = true
+				time.Sleep(shardedRetryBackoff)
+				continue
+			}
+
+			errCode := mapPBErr(resp.GetError())
+			switch errCode {
+			case kvraftapi.OK, kvraftapi.ErrNoKey:
+				return errCode
+			case kvraftapi.ErrVersion:
+				if retried {
+					return kvraftapi.ErrMaybe
+				}
+				return kvraftapi.ErrVersion
+			default:
+				retried = true
+				time.Sleep(shardedRetryBackoff)
+			}
 		}
-		return mapPBErr(resp.GetError())
 	}
 
 	args := kvraftapi.PutArgs{Key: key, Value: value, Version: version, TTL: ttlSeconds}
@@ -513,13 +594,33 @@ func (ck *Clerk) PutWithTTL(key string, value string, version kvraftapi.Tversion
 
 func (ck *Clerk) Delete(key string) kvraftapi.Err {
 	if ck.router != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		resp, err := ck.router.DeleteRoute(ctx, key)
-		if err != nil || resp == nil {
-			return kvraftapi.ErrWrongLeader
+		deadline := time.Now().Add(shardedRetryWindow)
+		attempts := 0
+
+		for {
+			if attempts >= shardedMaxAttempts || time.Now().After(deadline) {
+				return kvraftapi.ErrWrongLeader
+			}
+
+			attemptCtx, cancel := context.WithDeadline(context.Background(), deadline)
+			attemptCtx, cancel2 := context.WithTimeout(attemptCtx, shardedDeleteAttemptTimeout)
+			resp, err := ck.router.DeleteRoute(attemptCtx, key)
+			cancel2()
+			cancel()
+			attempts++
+
+			if err != nil || resp == nil {
+				time.Sleep(shardedRetryBackoff)
+				continue
+			}
+
+			errCode := mapPBErr(resp.GetError())
+			if errCode == kvraftapi.OK || errCode == kvraftapi.ErrNoKey {
+				return errCode
+			}
+
+			time.Sleep(shardedRetryBackoff)
 		}
-		return mapPBErr(resp.GetError())
 	}
 
 	timeout := time.After(10 * time.Second)
@@ -564,13 +665,27 @@ func (ck *Clerk) Delete(key string) kvraftapi.Err {
 // Scan 按前缀扫描键值。
 func (ck *Clerk) Scan(prefix string, limit int32) ([]*pb.KeyValue, kvraftapi.Err) {
 	if ck.router != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		items, err := ck.router.ScanRoute(ctx, prefix, limit)
-		if err != nil {
-			return nil, kvraftapi.ErrWrongLeader
+		deadline := time.Now().Add(shardedRetryWindow)
+		attempts := 0
+
+		for {
+			if attempts >= shardedMaxAttempts || time.Now().After(deadline) {
+				return nil, kvraftapi.ErrWrongLeader
+			}
+
+			attemptCtx, cancel := context.WithDeadline(context.Background(), deadline)
+			attemptCtx, cancel2 := context.WithTimeout(attemptCtx, shardedScanAttemptTimeout)
+			items, err := ck.router.ScanRoute(attemptCtx, prefix, limit)
+			cancel2()
+			cancel()
+			attempts++
+
+			if err == nil {
+				return items, kvraftapi.OK
+			}
+
+			time.Sleep(shardedRetryBackoff)
 		}
-		return items, kvraftapi.OK
 	}
 
 	timeout := time.After(10 * time.Second)

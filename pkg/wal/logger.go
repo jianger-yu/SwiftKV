@@ -187,6 +187,57 @@ func (l *Logger) Append(entry Entry) error {
 	return nil
 }
 
+// AppendAsync serializes and enqueues an entry without waiting for fsync completion.
+// It returns quickly and is intended for non-critical audit logging on hot paths.
+func (l *Logger) AppendAsync(entry Entry) error {
+	if l == nil || !l.enabled {
+		return nil
+	}
+	if entry.Timestamp == 0 {
+		entry.Timestamp = time.Now().UnixNano()
+	}
+	data, err := json.Marshal(entry)
+	if err != nil {
+		return fmt.Errorf("marshal wal entry: %w", err)
+	}
+	req := WALRequest{
+		Data: append(data, '\n'),
+		Done: nil,
+	}
+
+	l.mu.Lock()
+	if !l.replayDone {
+		l.mu.Unlock()
+		return errors.New("wal replay not completed; call Replay before AppendAsync")
+	}
+	if l.file == nil {
+		err := l.fatalErr
+		if err == nil {
+			err = errors.New("wal logger is closed")
+		}
+		l.mu.Unlock()
+		return fmt.Errorf("wal logger unavailable: %w", err)
+	}
+	if l.closing || !l.workerAlive || l.reqCh == nil {
+		l.mu.Unlock()
+		return errors.New("wal logger is closed")
+	}
+	if l.fatalErr != nil {
+		err := l.fatalErr
+		l.mu.Unlock()
+		return fmt.Errorf("wal logger unavailable: %w", err)
+	}
+
+	select {
+	case l.reqCh <- req:
+		l.mu.Unlock()
+		return nil
+	default:
+		l.mu.Unlock()
+		return errors.New("wal queue is full")
+	}
+}
+
 // TruncateUpTo 保留 raft_index > upToIndex 的条目。
 func (l *Logger) TruncateUpTo(upToIndex int64) error {
 	if l == nil || !l.enabled {
@@ -403,8 +454,10 @@ func (l *Logger) runWorker(file *os.File, reqCh <-chan WALRequest, stopCh <-chan
 
 		if workerErr != nil {
 			for i := range batch {
-				batch[i].Done <- workerErr
-				close(batch[i].Done)
+				if batch[i].Done != nil {
+					batch[i].Done <- workerErr
+					close(batch[i].Done)
+				}
 			}
 			batch = batch[:0]
 			return
@@ -421,8 +474,10 @@ func (l *Logger) runWorker(file *os.File, reqCh <-chan WALRequest, stopCh <-chan
 			workerErr = err
 		}
 		for i := range batch {
-			batch[i].Done <- err
-			close(batch[i].Done)
+			if batch[i].Done != nil {
+				batch[i].Done <- err
+				close(batch[i].Done)
+			}
 		}
 		batch = batch[:0]
 	}
@@ -431,8 +486,10 @@ func (l *Logger) runWorker(file *os.File, reqCh <-chan WALRequest, stopCh <-chan
 		select {
 		case req := <-reqCh:
 			if workerErr != nil {
-				req.Done <- workerErr
-				close(req.Done)
+				if req.Done != nil {
+					req.Done <- workerErr
+					close(req.Done)
+				}
 				continue
 			}
 			batch = append(batch, req)
