@@ -182,11 +182,8 @@ func (ck *Clerk) preferredCandidates(key string) []int {
 		return []int{0}
 	}
 
-	// 计算一致性哈希推荐节点
-	count := 3
-	if len(ck.grpcServers) < count {
-		count = len(ck.grpcServers)
-	}
+	// 计算一致性哈希推荐节点，使用当前节点数作为基准，避免固定常量不适配规模变化。
+	count := len(ck.grpcServers)
 
 	nodes := ck.hasher.GetNodes(key, count)         // 哈希环推荐的节点地址切片
 	seen := make(map[int]bool, len(ck.grpcServers)) // 去重查重表

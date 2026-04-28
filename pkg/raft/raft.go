@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/gob"
+	"errors"
 	"math/rand"
 	"net/rpc"
 	"os"
@@ -32,9 +33,6 @@ type Persister interface {
 	EnqueueSave(raftstate []byte, snapshot []byte) <-chan error
 	EnqueueAppendRaftState(data []byte) <-chan error
 	EnqueueSaveHardState(hardstate []byte) <-chan error
-	Save(raftstate []byte, snapshot []byte)
-	AppendRaftState(data []byte)
-	SaveHardState(hardstate []byte)
 	RaftStateSize() int
 }
 
@@ -52,14 +50,6 @@ type LogEntry struct {
 	commandBytes []byte
 }
 
-type persistentState struct {
-	CurrentTerm       int
-	VotedFor          int
-	Log               []LogEntry
-	LastIncludedIndex int
-	LastIncludedTerm  int
-}
-
 type hardState struct {
 	CurrentTerm int
 	VotedFor    int
@@ -73,8 +63,6 @@ type RaftPerfStats struct {
 	PersistWaitNanos    int64
 	PersistWaitAvgNanos float64
 }
-
-const persistFormatV2Magic = -20260420
 
 const (
 	persistFormatV3Magic uint32 = 0x4b565233 // "KVR3"
@@ -96,11 +84,6 @@ const (
 	persistV3AppendOffHeaderLen = 20
 	persistV3AppendOffDeltaLen  = 24
 )
-
-type persistedLogEntry struct {
-	Term        int
-	CommandData []byte
-}
 
 type persistedCommandEnvelope struct {
 	Value interface{}
@@ -237,6 +220,13 @@ func (rf *Raft) waitPersistDone(done <-chan error) error {
 	atomic.AddInt64(&rf.persistWaitNanos, time.Since(started).Nanoseconds())
 	atomic.AddInt64(&rf.persistWaitCount, 1)
 	return err
+}
+
+func immediatePersistError(err error) <-chan error {
+	ch := make(chan error, 1)
+	ch <- err
+	close(ch)
+	return ch
 }
 
 func (rf *Raft) PerfStatsSnapshot() RaftPerfStats {
@@ -594,28 +584,21 @@ func (rf *Raft) encodePersistentStateIncrementalLocked() ([]byte, bool) {
 
 func (rf *Raft) enqueuePersistLocked(snapshot []byte) (<-chan error, int, int) {
 	dirtyFromBefore := rf.persistV3DirtyFrom
-	if state, ok := rf.encodePersistentStateIncrementalLocked(); ok {
-		logCount := len(rf.log)
-		stateLen := len(state)
-		if rf.canPersistV3AppendLocked(snapshot, state, dirtyFromBefore) {
-			if payload, payloadOK := buildPersistV3AppendPayload(state, rf.persistV3QueuedLen); payloadOK {
-				rf.markPersistV3QueuedLocked(stateLen, logCount)
-				return rf.persister.EnqueueAppendRaftState(payload), stateLen, logCount
-			}
+	state, ok := rf.encodePersistentStateIncrementalLocked()
+	if !ok {
+		rf.invalidatePersistV3CacheLocked()
+		return immediatePersistError(errors.New("persist v3 encode failed")), -1, -1
+	}
+	logCount := len(rf.log)
+	stateLen := len(state)
+	if rf.canPersistV3AppendLocked(snapshot, state, dirtyFromBefore) {
+		if payload, payloadOK := buildPersistV3AppendPayload(state, rf.persistV3QueuedLen); payloadOK {
+			rf.markPersistV3QueuedLocked(stateLen, logCount)
+			return rf.persister.EnqueueAppendRaftState(payload), stateLen, logCount
 		}
-		rf.markPersistV3QueuedLocked(stateLen, logCount)
-		return rf.persister.EnqueueSave(state, snapshot), stateLen, logCount
 	}
-
-	state := persistentState{
-		CurrentTerm:       rf.CurrentTerm,
-		VotedFor:          rf.VotedFor,
-		Log:               rf.log,
-		LastIncludedIndex: rf.lastIncludedIndex,
-		LastIncludedTerm:  rf.lastIncludedTerm,
-	}
-	rf.invalidatePersistV3CacheLocked()
-	return rf.persister.EnqueueSave(encodePersistentState(state), snapshot), -1, -1
+	rf.markPersistV3QueuedLocked(stateLen, logCount)
+	return rf.persister.EnqueueSave(state, snapshot), stateLen, logCount
 }
 
 func (rf *Raft) commitPersistResult(stateLen int, logCount int, err error) {
@@ -660,11 +643,6 @@ func (rf *Raft) readPersist(data []byte) {
 	if rf.readPersistV3(data) {
 		return
 	}
-	if rf.readPersistV2(data) {
-		rf.invalidatePersistV3CacheLocked()
-		return
-	}
-	rf.readPersistLegacy(data)
 	rf.invalidatePersistV3CacheLocked()
 }
 
@@ -743,91 +721,6 @@ func (rf *Raft) readPersistV3(data []byte) bool {
 	return true
 }
 
-func (rf *Raft) readPersistV2(data []byte) bool {
-	if data == nil || len(data) < 1 { // 没有任何状态时启动
-		return false
-	}
-
-	r := bytes.NewBuffer(data)
-	d := gob.NewDecoder(r)
-
-	var magic int
-	if d.Decode(&magic) != nil || magic != persistFormatV2Magic {
-		return false
-	}
-
-	var currentTerm int
-	var votedFor int
-	var log []persistedLogEntry
-	var lastIncludedIndex int
-	var lastIncludedTerm int
-
-	if d.Decode(&currentTerm) != nil ||
-		d.Decode(&votedFor) != nil ||
-		d.Decode(&log) != nil ||
-		d.Decode(&lastIncludedIndex) != nil ||
-		d.Decode(&lastIncludedTerm) != nil {
-		return false
-	}
-
-	decodedLog := make([]LogEntry, len(log))
-	for i := range log {
-		cmd, ok := decodeCommandFromBytes(log[i].CommandData)
-		if !ok {
-			return false
-		}
-		decodedLog[i] = LogEntry{
-			Term:         log[i].Term,
-			Command:      cmd,
-			commandBytes: append([]byte(nil), log[i].CommandData...),
-		}
-	}
-
-	if len(decodedLog) == 0 {
-		decodedLog = []LogEntry{{Term: lastIncludedTerm}}
-	}
-
-	rf.CurrentTerm = currentTerm
-	rf.VotedFor = votedFor
-	rf.log = decodedLog
-	rf.lastIncludedIndex = lastIncludedIndex
-	rf.lastIncludedTerm = lastIncludedTerm
-	return true
-}
-
-func (rf *Raft) readPersistLegacy(data []byte) {
-	if data == nil || len(data) < 1 { // 没有任何状态时启动
-		return
-	}
-
-	r := bytes.NewBuffer(data)
-	d := gob.NewDecoder(r)
-
-	var currentTerm int
-	var votedFor int
-	var log []LogEntry
-	var lastIncludedIndex int
-	var lastIncludedTerm int
-
-	if d.Decode(&currentTerm) != nil ||
-		d.Decode(&votedFor) != nil ||
-		d.Decode(&log) != nil ||
-		d.Decode(&lastIncludedIndex) != nil ||
-		d.Decode(&lastIncludedTerm) != nil {
-		return
-	}
-
-	if len(log) == 0 {
-		log = []LogEntry{{Term: lastIncludedTerm}}
-	}
-
-	rf.CurrentTerm = currentTerm
-	rf.VotedFor = votedFor
-	rf.log = log
-	rf.lastIncludedIndex = lastIncludedIndex
-	rf.lastIncludedTerm = lastIncludedTerm
-}
-
 func (rf *Raft) readHardState(data []byte) {
 	if data == nil || len(data) < 1 {
 		return
@@ -892,44 +785,6 @@ func ensureEntryCommandEncoded(entry *LogEntry) bool {
 	}
 	entry.commandBytes = encoded
 	return true
-}
-
-func encodePersistentStateLegacy(s persistentState) []byte {
-	buf := new(bytes.Buffer)
-	enc := gob.NewEncoder(buf)
-
-	_ = enc.Encode(s.CurrentTerm)
-	_ = enc.Encode(s.VotedFor)
-	_ = enc.Encode(s.Log)
-	_ = enc.Encode(s.LastIncludedIndex)
-	_ = enc.Encode(s.LastIncludedTerm)
-
-	return buf.Bytes()
-}
-
-func encodePersistentState(s persistentState) []byte {
-	persistedLog := make([]persistedLogEntry, len(s.Log))
-	for i := range s.Log {
-		if !ensureEntryCommandEncoded(&s.Log[i]) {
-			return encodePersistentStateLegacy(s)
-		}
-		persistedLog[i] = persistedLogEntry{
-			Term:        s.Log[i].Term,
-			CommandData: s.Log[i].commandBytes,
-		}
-	}
-
-	buf := new(bytes.Buffer)
-	enc := gob.NewEncoder(buf)
-
-	_ = enc.Encode(persistFormatV2Magic)
-	_ = enc.Encode(s.CurrentTerm)
-	_ = enc.Encode(s.VotedFor)
-	_ = enc.Encode(persistedLog)
-	_ = enc.Encode(s.LastIncludedIndex)
-	_ = enc.Encode(s.LastIncludedTerm)
-
-	return buf.Bytes()
 }
 
 func encodeHardState(currentTerm, votedFor int) []byte {
